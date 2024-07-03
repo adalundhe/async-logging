@@ -129,7 +129,7 @@ class LoggerStream:
             resolved_path.touch()
 
         else:
-            self._files[logfile_path] = open(path, "r+")
+            self._files[logfile_path] = open(path, "rb+")
 
     def _get_creation_date(self, logfile_path: str):
         resolved_path = pathlib.Path(logfile_path)
