@@ -4,4 +4,5 @@ if [[ ! -d /workspace/.venv ]]; then
 fi
 
 source .venv/bin/activate
-
+uv pip install -r requirements.txt
+uv pip install -e .
