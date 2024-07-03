@@ -3,7 +3,6 @@ import datetime
 import io
 import os
 import pathlib
-import platform
 import sys
 import threading
 import uuid
@@ -128,37 +127,61 @@ class LoggerStream:
         if not os.path.exists(path):
             resolved_path.touch()
 
-        else:
-            self._files[logfile_path] = open(path, "rb+")
+        self._files[logfile_path] = open(path, "ab+")
 
-    def _get_creation_date(self, logfile_path: str):
+    async def _rotate(
+        self,
+        logfile_path: str,
+    ):
+        await self._file_locks[logfile_path].acquire()
+        await asyncio.to_thread(
+            self._rotate_logfile,
+            self._rotation_schedules[logfile_path],
+            logfile_path,
+        )
+
+        self._file_locks[logfile_path].release()
+
+    def _get_logfile_metadata(self, logfile_path: str) -> Dict[str, float]:
         resolved_path = pathlib.Path(logfile_path)
-        path = str(resolved_path.absolute().resolve())
 
-        if not os.path.exists(logfile_path):
-            return
+        logfile_metadata_path = os.path.join(
+            str(resolved_path.parent.absolute().resolve()), ".logging.json"
+        )
 
-        if platform.system() == "Windows":
-            return os.path.getctime(path)
-        else:
-            stat = os.stat(path)
-            try:
-                return stat.st_birthtime
-            except AttributeError:
-                # We're probably on Linux. No easy way to get creation dates here,
-                # so we'll settle for when its content was last modified.
-                return stat.st_mtime
+        if os.path.exists(logfile_metadata_path):
+            metadata_file = open(logfile_metadata_path, "+rb")
+            return msgspec.json.decode(metadata_file.read())
+
+        return {}
+
+    def _update_logfile_metadata(
+        self,
+        logfile_path: str,
+        logfile_metadata: Dict[str, float],
+    ):
+        resolved_path = pathlib.Path(logfile_path)
+
+        logfile_metadata_path = os.path.join(
+            str(resolved_path.parent.absolute().resolve()), ".logging.json"
+        )
+
+        with open(logfile_metadata_path, "+wb") as metadata_file:
+            metadata_file.write(msgspec.json.encode(logfile_metadata))
 
     def _rotate_logfile(
         self,
         rotation_max_age: float,
         logfile_path: str,
     ):
-        created_time = self._get_creation_date(logfile_path)
-
-        file_age_seconds = datetime.datetime.now().timestamp() - created_time
         resolved_path = pathlib.Path(logfile_path)
         path = str(resolved_path.absolute().resolve())
+
+        logfile_metadata = self._get_logfile_metadata(path)
+
+        created_time = logfile_metadata.get(path, datetime.datetime.now().timestamp())
+
+        file_age_seconds = datetime.datetime.now().timestamp() - created_time
         logfile_data = b""
 
         if file_age_seconds >= rotation_max_age:
@@ -169,7 +192,7 @@ class LoggerStream:
 
         if len(logfile_data) > 0:
             timestamp = datetime.datetime.now().timestamp()
-            archived_filename = f"{resolved_path.stem}_archived_{timestamp}.zst"
+            archived_filename = f"{resolved_path.stem}_{timestamp}_archived.zst"
             archive_path = os.path.join(
                 str(resolved_path.parent.absolute().resolve()),
                 archived_filename,
@@ -178,7 +201,12 @@ class LoggerStream:
             with open(archive_path, "wb") as archived_file:
                 archived_file.write(logfile_data)
 
-            self._files[logfile_path] = open(path, "wb")
+            self._files[logfile_path] = open(path, "wb+")
+            created_time = datetime.datetime.now().timestamp()
+
+        logfile_metadata[path] = created_time
+
+        self._update_logfile_metadata(path, logfile_metadata)
 
     async def close(self):
         await asyncio.gather(
@@ -351,12 +379,11 @@ class LoggerStream:
                 directory=directory,
             )
 
+        if rotation_schedule:
+            self._rotation_schedules[logfile_path] = TimeParser(rotation_schedule).time
+
         if self._rotation_schedules.get(logfile_path):
-            await asyncio.to_thread(
-                self._rotate_logfile,
-                self._rotation_schedules[logfile_path],
-                logfile_path,
-            )
+            await self._rotate(logfile_path)
 
         log_file, line_number, function_name = self.find_caller()
         snowlfake = Snowflake.parse(snowflake_id)
