@@ -1,0 +1,1 @@
+{"level":"INFO","node_type":"WORKER","node_id":495,"line_number":10,"epoch":0,"sequence":0,"filename":"/workspace/examples/record_test.py","function_name":"test_entry","event":"test","context":"This is a test","thread_id":16727,"timestamp":"2024-07-03T18:43:04.427802+00:00","tags":[],"test":null,"workflow":null,"hook":null,"location":"local"}

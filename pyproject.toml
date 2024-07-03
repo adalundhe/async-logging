@@ -1,0 +1,27 @@
+[project]
+name = "async-logging"
+version = "0.1.0"
+requires-python = ">= 3.11"
+readme = "README.md"
+license = {file = "LICENSE"}
+keywords = ["async", "logging", "python", "distributed"]
+dependencies = [
+  "msgspec",
+  "zstandard",
+]
+authors = [
+  {name = "Ada Lundhe", email = "corpheus91@gmail.com"},
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  # Pick your license as you wish (see also "license" above)
+  "License :: OSI Approved :: MIT License",
+
+  # Specify the Python versions you support here.
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
