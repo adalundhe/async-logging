@@ -1,7 +1,7 @@
 from collections import defaultdict
-from typing import Dict, Set
+from typing import Dict
 
-from async_logging.models import LogLevel, NodeType
+from async_logging.models import Entry, LogLevel
 
 from .logger_context import LoggerContext
 from .logger_stream import LoggerStream
@@ -19,13 +19,11 @@ class Logger:
         self,
         filename: str | None = None,
         directory: str | None = None,
-        stream_type: StreamType = StreamType.STDOUT,
         rotation_schedule: str | None = None,
     ):
         context = LoggerContext(
             filename=filename,
             directory=directory,
-            stream_type=stream_type,
             rotation_schedule=rotation_schedule,
         )
 
@@ -33,57 +31,35 @@ class Logger:
 
     async def log(
         self,
-        event: str,
-        context: str,
-        snowflake_id: int | None = None,
-        test: str | None = None,
-        workflow: str | None = None,
-        hook: str | None = None,
-        level: LogLevel = LogLevel.INFO,
-        node_type: NodeType = NodeType.WORKER,
-        location: str = "local",
-        tags: Set[str] | None = None,
+        entry: Entry,
+        template: str | None = None,
     ):
+        stream = (
+            StreamType.STDOUT
+            if entry.level
+            in [
+                LogLevel.DEBUG,
+                LogLevel.INFO,
+                LogLevel.ERROR,
+            ]
+            else StreamType.STDERR
+        )
+
         return await self._streams["default"].log(
-            event,
-            context,
-            snowflake_id=snowflake_id,
-            test=test,
-            workflow=workflow,
-            hook=hook,
-            level=level,
-            node_type=node_type,
-            location=location,
-            tags=tags,
+            entry,
+            template=template,
+            stream=stream,
         )
 
     async def log_to_file(
         self,
-        event: str,
-        context: str,
-        snowflake_id: int | None = None,
-        test: str | None = None,
-        workflow: str | None = None,
-        hook: str | None = None,
-        level: LogLevel = LogLevel.INFO,
-        node_type: NodeType = NodeType.WORKER,
-        location: str = "local",
-        tags: Set[str] | None = None,
+        entry: Entry,
         filename: str | None = None,
         directory: str | None = None,
         rotation_schedule: str | None = None,
     ):
         return await self._streams["default"].log_to_file(
-            event,
-            context,
-            snowflake_id=snowflake_id,
-            test=test,
-            workflow=workflow,
-            hook=hook,
-            level=level,
-            node_type=node_type,
-            location=location,
-            tags=tags,
+            entry,
             filename=filename,
             directory=directory,
             rotation_schedule=rotation_schedule,

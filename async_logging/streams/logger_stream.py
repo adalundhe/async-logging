@@ -7,14 +7,15 @@ import sys
 import threading
 import uuid
 from collections import defaultdict
-from typing import Dict, Set
+from typing import Dict
 
 import msgspec
 import zstandard
 
-from async_logging.models import Entry, LogLevel, NodeType
+from async_logging.config.logging_config import LoggingConfig
+from async_logging.models import Entry, LogLevel
 from async_logging.rotation import TimeParser
-from async_logging.snowflake import Snowflake, SnowflakeGenerator
+from async_logging.snowflake import SnowflakeGenerator
 
 from .protocol import LoggerProtocol
 from .stream_type import StreamType
@@ -41,11 +42,15 @@ _srcfile = anchor.__code__.co_filename
 
 
 class LoggerStream:
-    def __init__(self) -> None:
+    def __init__(self, name: str | None = None) -> None:
+        if name is None:
+            name = "default"
+
+        self._name = name
         self._stdout: io.TextIO | None = None
         self._stderr: io.TextIO | None = None
         self._init_lock = asyncio.Lock()
-        self._stream_writer: asyncio.StreamWriter | None = None
+        self._stream_writers: Dict[StreamType, asyncio.StreamWriter] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._generator: SnowflakeGenerator | None = None
         self._compressor: zstandard.ZstdCompressor | None = None
@@ -55,17 +60,10 @@ class LoggerStream:
         self._cwd: str | None = None
         self._default_logfile_path: str | None = None
         self._rotation_schedules: Dict[str, float] = {}
+        self._config = LoggingConfig()
+        self._initialized: bool = False
 
-    async def initialize(
-        self,
-        stream_type: StreamType = StreamType.STDOUT,
-    ) -> asyncio.StreamWriter:
-        if self._stdout is None:
-            self._stdout = sys.stdout
-
-        if self._stderr is None:
-            self._stderr = sys.stderr
-
+    async def initialize(self) -> asyncio.StreamWriter:
         if self._generator is None:
             self._generator = SnowflakeGenerator(
                 (uuid.uuid1().int + threading.get_native_id()) >> 64
@@ -78,17 +76,29 @@ class LoggerStream:
             self._loop = asyncio.get_event_loop()
 
         async with self._init_lock:
-            if self._stream_writer is None:
+            if self._stream_writers.get(StreamType.STDOUT) is None:
                 transport, protocol = await self._loop.connect_write_pipe(
-                    lambda: LoggerProtocol(),
-                    self._stdout if stream_type == StreamType.STDOUT else self._stderr,
+                    lambda: LoggerProtocol(), sys.stdout
                 )
 
-                self._stream_writer = asyncio.StreamWriter(
-                    transport, protocol, None, self._loop
+                self._stream_writers[StreamType.STDOUT] = asyncio.StreamWriter(
+                    transport,
+                    protocol,
+                    None,
+                    self._loop,
                 )
 
-            return self._stream_writer
+            if self._stream_writers.get(StreamType.STDERR) is None:
+                transport, protocol = await self._loop.connect_write_pipe(
+                    lambda: LoggerProtocol(), sys.stderr
+                )
+
+                self._stream_writers[StreamType.STDERR] = asyncio.StreamWriter(
+                    transport,
+                    protocol,
+                    None,
+                    self._loop,
+                )
 
     async def open_file(
         self,
@@ -177,9 +187,11 @@ class LoggerStream:
         resolved_path = pathlib.Path(logfile_path)
         path = str(resolved_path.absolute().resolve())
 
-        logfile_metadata = self._get_logfile_metadata(path)
+        logfile_metadata = self._get_logfile_metadata(logfile_path)
 
-        created_time = logfile_metadata.get(path, datetime.datetime.now().timestamp())
+        created_time = logfile_metadata.get(
+            logfile_path, datetime.datetime.now().timestamp()
+        )
 
         file_age_seconds = datetime.datetime.now().timestamp() - created_time
         logfile_data = b""
@@ -204,17 +216,21 @@ class LoggerStream:
             self._files[logfile_path] = open(path, "wb+")
             created_time = datetime.datetime.now().timestamp()
 
-        logfile_metadata[path] = created_time
+        logfile_metadata[logfile_path] = created_time
 
-        self._update_logfile_metadata(path, logfile_metadata)
+        self._update_logfile_metadata(logfile_path, logfile_metadata)
 
     async def close(self):
         await asyncio.gather(
             *[self._close_file(logfile_path) for logfile_path in self._files]
         )
 
-        await self._stream_writer.drain()
-        self._stream_writer.close()
+        await asyncio.gather(
+            *[writer.drain() for writer in self._stream_writers.values()]
+        )
+
+        for writer in self._stream_writers.values():
+            writer.close()
 
     async def close_file(
         self,
@@ -261,95 +277,95 @@ class LoggerStream:
 
     async def log(
         self,
-        event: str,
-        context: str,
-        snowflake_id: int | None = None,
-        test: str | None = None,
-        workflow: str | None = None,
-        hook: str | None = None,
-        level: LogLevel = LogLevel.INFO,
-        node_type: NodeType = NodeType.WORKER,
-        location: str = "local",
-        tags: Set[str] | None = None,
-    ):
-        """
-        Actually log the specified logging record to the stream.
-        """
-        if self._stream_writer is None:
-            self._stream_writer = await self.initialize()
-
-        if snowflake_id is None:
-            snowflake_id = self._generator.generate()
-
-        if tags is None:
-            tags = set()
-
-        log_file, line_number, function_name = self.find_caller()
-        snowlfake = Snowflake.parse(snowflake_id)
-
-        try:
-            record = Entry(
-                level=level,
-                node_type=node_type,
-                timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                node_id=snowlfake.instance,
-                epoch=snowlfake.epoch,
-                sequence=snowlfake.seq,
-                thread_id=threading.get_native_id(),
-                line_number=line_number,
-                filename=log_file,
-                function_name=function_name,
-                event=event,
-                context=context,
-                test=test,
-                workflow=workflow,
-                hook=hook,
-                location=location,
-                tags=tags,
-            )
-
-            self._stream_writer.write(record.to_message())
-            await self._stream_writer.drain()
-
-        except Exception as err:
-            record = Entry(
-                level=LogLevel.ERROR,
-                node_type=node_type,
-                timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                node_id=snowlfake.instance,
-                epoch=snowlfake.epoch,
-                sequence=snowlfake.seq,
-                thread_id=threading.get_native_id(),
-                line_number=line_number,
-                filename=log_file,
-                function_name=function_name,
-                event="logging_error",
-                context=str(err),
-                test=test,
-                workflow=workflow,
-                hook=hook,
-                location=location,
-                tags=tags,
-            )
-
-            await asyncio.to_thread(sys.stderr.write, record.to_error_string())
-
-    async def log_to_file(
-        self,
-        event: str,
-        context: str,
-        snowflake_id: int | None = None,
-        test: str | None = None,
-        workflow: str | None = None,
-        hook: str | None = None,
-        level: LogLevel = LogLevel.INFO,
-        node_type: NodeType = NodeType.WORKER,
-        location: str = "local",
-        tags: Set[str] | None = None,
+        entry: Entry,
+        template: str | None = None,
         filename: str | None = None,
         directory: str | None = None,
         rotation_schedule: str | None = None,
     ):
+        if filename:
+            await self._log_to_file(
+                entry,
+                filename=filename,
+                directory=directory,
+                rotation_schedule=rotation_schedule,
+            )
+
+        else:
+            await self._log(
+                entry,
+                template=template,
+            )
+
+    async def _log(
+        self,
+        entry: Entry,
+        template: str | None = None,
+    ):
+        stream = (
+            StreamType.STDOUT
+            if entry.level
+            in [
+                LogLevel.DEBUG,
+                LogLevel.INFO,
+                LogLevel.ERROR,
+            ]
+            else StreamType.STDERR
+        )
+
+        if self._config.enabled(self._name, entry.level) is False:
+            return
+
+        if self._initialized is None:
+            await self.initialize()
+
+        stream_writer = self._stream_writers[stream]
+
+        if template is None:
+            template = "{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}"
+
+        log_file, line_number, function_name = self.find_caller()
+
+        try:
+            stream_writer.write(
+                entry.to_template(
+                    template,
+                    context={
+                        "filename": log_file,
+                        "function_name": function_name,
+                        "line_number": line_number,
+                    },
+                ).encode()
+                + b"\n"
+            )
+            await stream_writer.drain()
+
+        except Exception as err:
+            error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
+
+            await asyncio.to_thread(
+                sys.stderr.write,
+                entry.to_template(
+                    error_template,
+                    context={
+                        "filename": log_file,
+                        "function_name": function_name,
+                        "line_number": line_number,
+                        "error": str(err),
+                    },
+                ),
+            )
+
+    async def _log_to_file(
+        self,
+        entry: Entry,
+        filename: str | None = None,
+        directory: str | None = None,
+        rotation_schedule: str | None = None,
+    ):
+        if self._config.enabled(self._name, entry.level) is False:
+            return
+
         if self._cwd is None:
             self._cwd = await asyncio.to_thread(os.getcwd)
 
@@ -367,12 +383,6 @@ class LoggerStream:
             directory = os.path.join(self._cwd, "logs")
             logfile_path = os.path.join(directory, filename)
 
-        if snowflake_id is None:
-            snowflake_id = self._generator.generate()
-
-        if tags is None:
-            tags = set()
-
         if self._files.get(logfile_path) is None:
             await self.open_file(
                 filename,
@@ -386,57 +396,38 @@ class LoggerStream:
             await self._rotate(logfile_path)
 
         log_file, line_number, function_name = self.find_caller()
-        snowlfake = Snowflake.parse(snowflake_id)
 
         try:
-            record = Entry(
-                level=level,
-                node_type=node_type,
-                timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                node_id=snowlfake.instance,
-                epoch=snowlfake.epoch,
-                sequence=snowlfake.seq,
-                thread_id=threading.get_native_id(),
-                line_number=line_number,
-                filename=log_file,
-                function_name=function_name,
-                event=event,
-                context=context,
-                test=test,
-                workflow=workflow,
-                hook=hook,
-                location=location,
-                tags=tags,
+            entry_dict = entry.to_dict()
+            entry_dict.update(
+                {
+                    "filename": log_file,
+                    "function_name": function_name,
+                    "line_number": line_number,
+                }
             )
 
             await asyncio.to_thread(
                 self._write_to_file,
-                record,
+                entry,
                 logfile_path,
             )
 
         except Exception as err:
-            record = Entry(
-                level=LogLevel.ERROR,
-                node_type=node_type,
-                timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
-                node_id=snowlfake.instance,
-                epoch=snowlfake.epoch,
-                sequence=snowlfake.seq,
-                thread_id=threading.get_native_id(),
-                line_number=line_number,
-                filename=log_file,
-                function_name=function_name,
-                event="logging_error",
-                context=str(err),
-                test=test,
-                workflow=workflow,
-                hook=hook,
-                location=location,
-                tags=tags,
-            )
+            error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
 
-            await asyncio.to_thread(sys.stderr.write, record.to_error_string())
+            await asyncio.to_thread(
+                sys.stderr.write,
+                entry.to_template(
+                    error_template,
+                    context={
+                        "filename": log_file,
+                        "function_name": function_name,
+                        "line_number": line_number,
+                        "error": str(err),
+                    },
+                ),
+            )
 
     def _write_to_file(
         self,

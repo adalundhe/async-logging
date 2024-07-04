@@ -4,7 +4,6 @@ import os
 from async_logging.rotation import TimeParser
 
 from .logger_stream import LoggerStream
-from .stream_type import StreamType
 
 
 class LoggerContext:
@@ -12,17 +11,15 @@ class LoggerContext:
         self,
         filename: str | None = None,
         directory: str | None = None,
-        stream_type: StreamType = StreamType.STDOUT,
         rotation_schedule: str | None = None,
     ) -> None:
         self.filename = filename
         self.directory = directory
-        self.stream_type = stream_type
         self.rotation_schedule = rotation_schedule
         self.stream = LoggerStream()
 
     async def __aenter__(self):
-        await self.stream.initialize(stream_type=self.stream_type)
+        await self.stream.initialize()
 
         if self.stream._cwd is None:
             self.stream._cwd = await asyncio.to_thread(os.getcwd)

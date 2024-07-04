@@ -1,46 +1,45 @@
 import datetime
+import threading
+from typing import Any, Dict
 
 import msgspec
 
 from .log_level import LogLevel
-from .node_type import NodeType
 
 
-class Entry(msgspec.Struct):
+class Entry(msgspec.Struct, kw_only=True):
+    message: str | None = None
+    thread_id: int = msgspec.field(
+        default_factory=threading.get_native_id,
+    )
+    timestamp: str = msgspec.field(
+        default_factory=lambda: datetime.datetime.now(datetime.UTC).isoformat()
+    )
+    tags: set[str] = msgspec.field(
+        default_factory=set,
+    )
     level: LogLevel
-    node_type: NodeType
-    node_id: int
-    line_number: int
-    epoch: int
-    sequence: int
-    filename: str
-    function_name: str
-    event: str
-    context: str
-    thread_id: int
-    timestamp: datetime.datetime
-    tags: set[str] = set()
-    test: str | None = None
-    workflow: str | None = None
-    hook: str | None = None
-    location: str = "local"
 
-    def to_message(self):
-        test_source = ""
-        if self.test and self.workflow:
-            test_source = f"{self.test}.{self.workflow} - "
+    def to_dict(self):
+        return {
+            field: getattr(self, field)
+            for field in self.__struct_fields__
+            if getattr(self, field) is not None
+        }
 
-        if self.test and self.workflow and self.hook:
-            test_source = f"{test_source}.{self.workflow}.{self.hook} - "
+    def to_template(
+        self,
+        template: str,
+        context: Dict[str, Any] | None = None,
+    ):
+        kwargs: Dict[
+            str,
+            int | str | bool | float | LogLevel | list | dict | set | Any,
+        ] = {field: getattr(self, field) for field in self.__struct_fields__}
 
-        return f"{self.timestamp} - {self.level} - {self.node_id} / {self.thread_id} - {test_source}{self.event}: {self.context}\n".encode()
+        kwargs["level"] = kwargs["level"].value
 
-    def to_error_string(self):
-        test_source = ""
-        if self.test and self.workflow:
-            test_source = f"{self.test}.{self.workflow} - "
+        if context:
+            kwargs.update(context)
 
-        if self.test and self.workflow and self.hook:
-            test_source = f"{test_source}.{self.workflow}.{self.hook} - "
-
-        return f"{self.timestamp} - {self.level} - {self.node_id} / {self.thread_id} - {self.filename}:{self.function_name}.{self.line_number} - {test_source}{self.event}: {self.context}\n"
+        return template.format(**kwargs)
