@@ -2,21 +2,34 @@ import asyncio
 import os
 
 from async_logging.rotation import TimeParser
-
+from typing import Callable, TypeVar
 from .logger_stream import LoggerStream
+
+
+T = TypeVar('T')
 
 
 class LoggerContext:
     def __init__(
         self,
+        name: str | None = None,
+        template: str | None = None,
         filename: str | None = None,
         directory: str | None = None,
         rotation_schedule: str | None = None,
     ) -> None:
+        self.name = name
+        self.template = template
         self.filename = filename
         self.directory = directory
         self.rotation_schedule = rotation_schedule
-        self.stream = LoggerStream()
+        self.stream = LoggerStream(
+            name=name,
+            template=template,
+            filename=filename,
+            directory=directory,
+            rotation_schedule=rotation_schedule,
+        )
 
     async def __aenter__(self):
         await self.stream.initialize()

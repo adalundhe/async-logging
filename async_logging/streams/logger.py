@@ -1,11 +1,19 @@
 from collections import defaultdict
-from typing import Dict
-
+from typing import (
+    Dict, 
+    TypeVar, 
+    Callable,
+    Generic,
+)
+import pathlib
 from async_logging.models import Entry, LogLevel
-
+from .logger_stream import LoggerStream
 from .logger_context import LoggerContext
 from .logger_stream import LoggerStream
 from .stream_type import StreamType
+
+
+T = TypeVar('T', bound=Entry)
 
 
 class Logger:
@@ -17,50 +25,69 @@ class Logger:
 
     def create_context(
         self,
-        filename: str | None = None,
-        directory: str | None = None,
+        name: str | None = None,
+        template: str | None = None,
+        path: str | None = None,
         rotation_schedule: str | None = None,
     ):
+        if name is None:
+            name = 'default'
+
+        filename: str | None = None
+        directory: str | None = None
+
+        if path:
+            logfile_path = pathlib.Path(path)
+            is_logfile = len(logfile_path.suffix) > 0 
+
+            filename = logfile_path.name if is_logfile else None
+            directory = str(logfile_path.parent.absolute()) if is_logfile else str(logfile_path.absolute())
+
+
         context = LoggerContext(
+            name=name,
+            template=template,
             filename=filename,
             directory=directory,
             rotation_schedule=rotation_schedule,
         )
 
         return context
-
-    async def log(
+    
+    async def create(
         self,
-        entry: Entry,
+        name: str | None = None,
         template: str | None = None,
-    ):
-        stream = (
-            StreamType.STDOUT
-            if entry.level
-            in [
-                LogLevel.DEBUG,
-                LogLevel.INFO,
-                LogLevel.ERROR,
-            ]
-            else StreamType.STDERR
-        )
-
-        return await self._streams["default"].log(
-            entry,
-            template=template,
-            stream=stream,
-        )
-
-    async def log_to_file(
-        self,
-        entry: Entry,
-        filename: str | None = None,
-        directory: str | None = None,
+        path: str | None = None,
         rotation_schedule: str | None = None,
     ):
-        return await self._streams["default"].log_to_file(
-            entry,
+        if name is None:
+            name = 'default'
+
+        filename: str | None = None
+        directory: str | None = None
+
+        if name is None:
+            name = 'default'
+
+        if path:
+            logfile_path = pathlib.Path(path)
+            is_logfile = len(logfile_path.suffix) > 0 
+
+            filename = logfile_path.name if is_logfile else None
+            directory = str(logfile_path.parent.absolute()) if is_logfile else str(logfile_path.absolute())
+
+        stream = LoggerStream(
+            name=name,
+            template=template,
             filename=filename,
             directory=directory,
-            rotation_schedule=rotation_schedule,
+            rotation_schedule=rotation_schedule
+            
         )
+        
+        await stream.initialize()
+
+        self._streams[name] = stream
+
+        return stream
