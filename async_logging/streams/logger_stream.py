@@ -1,4 +1,5 @@
 import asyncio
+import signal
 import datetime
 import io
 import os
@@ -16,6 +17,11 @@ from async_logging.config.logging_config import LoggingConfig
 from async_logging.models import Entry, LogLevel, Log
 from async_logging.rotation import TimeParser
 from async_logging.snowflake import SnowflakeGenerator
+from async_logging.queue import (
+    LogProvider,
+    LogConsumer,
+)
+
 
 from .protocol import LoggerProtocol
 from .stream_type import StreamType
@@ -77,9 +83,19 @@ class LoggerStream:
         self._rotation_schedules: Dict[str, float] = {}
         self._config = LoggingConfig()
         self._initialized: bool = False
+        self._consumer: LogConsumer | None = None
+        self._provider: LogProvider | None = None
+        self._initialized: bool = False
+        self._closed = False
+        self._stderr: io.TextIOBase | None = None
+        self._stdout: io.TextIOBase | None = None
 
 
     async def initialize(self) -> asyncio.StreamWriter:
+        
+        if self._initialized:
+            return
+
         if self._generator is None:
             self._generator = SnowflakeGenerator(
                 (uuid.uuid1().int + threading.get_native_id()) >> 64
@@ -91,10 +107,22 @@ class LoggerStream:
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
 
+        if self._consumer is None:
+            self._consumer = LogConsumer()
+
+        if self._provider is None:
+            self._provider = LogProvider()
+
+        if self._stdout is None:
+            self._stdout = sys.stdout
+
+        if self._stderr is None:
+            self._stderr = sys.stderr
+
         async with self._init_lock:
             if self._stream_writers.get(StreamType.STDOUT) is None:
                 transport, protocol = await self._loop.connect_write_pipe(
-                    lambda: LoggerProtocol(), sys.stdout
+                    lambda: LoggerProtocol(), self._stdout
                 )
 
                 self._stream_writers[StreamType.STDOUT] = asyncio.StreamWriter(
@@ -106,7 +134,7 @@ class LoggerStream:
 
             if self._stream_writers.get(StreamType.STDERR) is None:
                 transport, protocol = await self._loop.connect_write_pipe(
-                    lambda: LoggerProtocol(), sys.stderr
+                    lambda: LoggerProtocol(), self._stderr
                 )
 
                 self._stream_writers[StreamType.STDERR] = asyncio.StreamWriter(
@@ -115,6 +143,8 @@ class LoggerStream:
                     None,
                     self._loop,
                 )
+        
+        self._initialized = True
 
     async def open_file(
         self,
@@ -237,16 +267,31 @@ class LoggerStream:
         self._update_logfile_metadata(logfile_path, logfile_metadata)
 
     async def close(self):
+
         await asyncio.gather(
             *[self._close_file(logfile_path) for logfile_path in self._files]
         )
+        self._consumer.stop()
+
+        await self._provider.signal_shutdown()
 
         await asyncio.gather(
             *[writer.drain() for writer in self._stream_writers.values()]
         )
 
-        for writer in self._stream_writers.values():
-            writer.close()
+        self._initialized = False
+
+    def abort(self):
+        for logfile_path in self._files:
+            if (
+                logfile := self._files.get(logfile_path)
+            ) and logfile.closed is False:
+                logfile.close()
+
+        self._stderr.flush()
+        self._stdout.flush()
+
+        self._consumer.abort()
 
     async def close_file(
         self,
@@ -270,7 +315,9 @@ class LoggerStream:
             file_lock.release()
 
     def _close_file_at_path(self, logfile_path: str):
-        if logfile := self._files.get(logfile_path):
+        if (
+            logfile := self._files.get(logfile_path)
+        ) and logfile.closed is False:
             logfile.close()
 
     def _to_logfile_path(
@@ -370,6 +417,9 @@ class LoggerStream:
 
         log_file, line_number, function_name = self._find_caller()
 
+        if stream_writer.is_closing():
+            return
+
         try:
             stream_writer.write(
                 entry.to_template(
@@ -388,21 +438,22 @@ class LoggerStream:
 
         except Exception as err:
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
-
-            await asyncio.to_thread(
-                sys.stderr.write,
-                entry.to_template(
-                    error_template,
-                    context={
-                        "filename": log_file,
-                        "function_name": function_name,
-                        "line_number": line_number,
-                        "error": str(err),
-                        "thread_id": threading.get_native_id(),
-                        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
-                    },
-                ),
-            )
+            
+            if self._stderr.closed is False:
+                await asyncio.to_thread(
+                    self._stderr.write,
+                    entry.to_template(
+                        error_template,
+                        context={
+                            "filename": log_file,
+                            "function_name": function_name,
+                            "line_number": line_number,
+                            "error": str(err),
+                            "thread_id": threading.get_native_id(),
+                            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                        },
+                    ),
+                )
 
     async def _log_to_file(
         self,
@@ -466,27 +517,32 @@ class LoggerStream:
         except Exception as err:
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
 
-            await asyncio.to_thread(
-                sys.stderr.write,
-                entry.to_template(
-                    error_template,
-                    context={
-                        "filename": log_file,
-                        "function_name": function_name,
-                        "line_number": line_number,
-                        "error": str(err),
-                        "thread_id": threading.get_native_id(),
-                        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
-                    },
-                ),
-            )
+            if self._stderr.closed is False:
+                await asyncio.to_thread(
+                    self._stderr.write,
+                    entry.to_template(
+                        error_template,
+                        context={
+                            "filename": log_file,
+                            "function_name": function_name,
+                            "line_number": line_number,
+                            "error": str(err),
+                            "thread_id": threading.get_native_id(),
+                            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                        },
+                    ),
+                )
 
     def _write_to_file(
         self,
         entry: Entry,
         logfile_path: str,
     ):
-        if logfile := self._files.get(logfile_path):
+        if (
+            logfile := self._files.get(logfile_path)
+        ) and (
+            logfile.closed is False
+        ):
             logfile.write(msgspec.json.encode(entry) + b"\n")
 
     def _find_caller(self):
@@ -502,3 +558,22 @@ class LoggerStream:
             frame.f_lineno,
             code.co_name,
         )
+    
+    async def receive(self):
+        async for log in self._consumer:
+            yield log
+    
+    async def enqueue(
+        self,
+        entry: T,
+    ):
+        log_file, line_number, function_name = self._find_caller()
+
+        self._provider.put(Log(
+            entry=entry,
+            filename=log_file,
+            function_name=function_name,
+            line_number=line_number,
+            thread_id=threading.get_native_id(),
+            timestamp=datetime.datetime.now(datetime.UTC).isoformat()
+        ))
