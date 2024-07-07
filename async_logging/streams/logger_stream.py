@@ -266,15 +266,16 @@ class LoggerStream:
 
         self._update_logfile_metadata(logfile_path, logfile_metadata)
 
-    async def close(self):
+    async def close(self, shutdown_subscribed: bool = False):
+
+        if shutdown_subscribed:
+            self._consumer.stop()
+            await self._provider.signal_shutdown()
 
         await asyncio.gather(
             *[self._close_file(logfile_path) for logfile_path in self._files]
         )
-        self._consumer.stop()
-
-        await self._provider.signal_shutdown()
-
+        
         await asyncio.gather(
             *[writer.drain() for writer in self._stream_writers.values()]
         )
@@ -559,8 +560,11 @@ class LoggerStream:
             code.co_name,
         )
     
-    async def receive(self):
-        async for log in self._consumer:
+    async def receive(
+        self,
+        filter: Callable[[T], bool] | None = None
+    ):
+        async for log in self._consumer.iter_logs(filter):
             yield log
     
     async def enqueue(

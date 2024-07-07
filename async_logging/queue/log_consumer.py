@@ -1,13 +1,20 @@
 import asyncio
 from async_logging.models import Log
-from typing import AsyncGenerator
+from typing import (
+    AsyncGenerator, 
+    TypeVar, 
+    Callable,
+)
+
+
+T = TypeVar('T')
 
 
 class LogConsumer:
 
     def __init__(self) -> None:
         self._running = False
-        self._queue = asyncio.Queue()
+        self._queue: asyncio.Queue[Log] = asyncio.Queue()
         self._wait_task: asyncio.Task | None = None
         self._loop = asyncio.get_event_loop()
         self._shutdown = False
@@ -25,6 +32,39 @@ class LogConsumer:
             self._wait_task = asyncio.create_task(self._queue.get())
             yield await self._wait_task
 
+    async def iter_logs(
+        self,
+        filter: Callable[[T], bool] | None = None
+    ) -> AsyncGenerator[Log, None]:
+        self._running = True
+        while self._running:
+            self._wait_task = asyncio.create_task(self._queue.get())
+
+            log: Log = await self._wait_task
+
+            if filter and filter(log.entry):
+                yield log
+
+            elif filter is None:
+                yield log
+
+            else:
+                self._queue.put_nowait(log)
+
+        remaining = self._queue.qsize()
+
+        for _ in range(remaining):
+            self._wait_task = asyncio.create_task(self._queue.get())
+            log: Log = await self._wait_task
+
+            if filter and filter(log.entry):
+                yield log
+
+            elif filter is None:
+                yield log
+
+            else:
+                self._queue.put_nowait(log)
 
     def put(self, log: Log):
         self._queue.put_nowait(log)

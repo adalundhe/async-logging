@@ -158,20 +158,27 @@ class Logger:
         logger._streams[name]._provider.subscribe(self._streams[name]._consumer)
         logger._contexts[name].stream._provider.subscribe(self._contexts[name].stream._consumer)
 
-    async def close(self):
+    async def close(
+        self,
+        shutdown_subscribed: bool = False
+    ):
 
         streams_count = len(self._streams)
 
         if streams_count > 0:
             await asyncio.gather(*[
-                stream.close() for stream in self._streams.values()
+                stream.close(
+                    shutdown_subscribed=shutdown_subscribed
+                ) for stream in self._streams.values()
             ])
 
         contexts_count = len(self._contexts)
 
         if contexts_count > 0:
             await asyncio.gather(*[
-                context.stream.close() for context in self._contexts.values()
+                context.stream.close(
+                    shutdown_subscribed=shutdown_subscribed
+                ) for context in self._contexts.values()
             ])
 
     def abort(self):

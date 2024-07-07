@@ -7,9 +7,8 @@ class TestLog(Entry, kw_only=True):
     value: int
     level: LogLevel = LogLevel.INFO
 
-def abort(logger: Logger, waiter: asyncio.Future):
-    logger.abort()
-    waiter.set_result(None)
+def filter_test_log(log: TestLog):
+    return log.value > 10
 
 async def read_from_consumer(logger: Logger):
 
@@ -17,21 +16,20 @@ async def read_from_consumer(logger: Logger):
     async with logger.create_context(
         template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message} and {value}"
     ) as ctx:
-        async for log in ctx.receive():
+        async for log in ctx.receive(
+            filter=filter_test_log
+        ):
             await ctx.log(log.entry)
 
 async def provide(logger: Logger):
 
 
-    async with logger.create_context(
-        template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message} and {value}"
-    ) as ctx:
+    async with logger.create_context() as ctx:
         await ctx.enqueue(TestLog(message="Hello!", value=10))
-        await ctx.enqueue(TestLog(message="Hello!", value=10))
+        await ctx.enqueue(TestLog(message="Hello!", value=20))
         await ctx.enqueue(TestLog(message="Hello!", value=10))
 
-    await logger.close()
-    
+    await logger.close(shutdown_subscribed=True)
 
 async def test_entry():
     try:
