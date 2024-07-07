@@ -3,12 +3,14 @@ import asyncio
 from collections import defaultdict
 from typing import (
     Dict, 
-    TypeVar, 
+    TypeVar,
+    Callable,
 )
 import pathlib
 from async_logging.models import Entry
 from .logger_stream import LoggerStream
 from .logger_context import LoggerContext
+from .retention_policy import RetentionPolicyConfig
 
 
 T = TypeVar('T', bound=Entry)
@@ -18,6 +20,7 @@ class Logger:
     def __init__(self) -> None:
         self._streams: Dict[str, LoggerStream] = defaultdict(LoggerStream)
         self._contexts: Dict[str, LoggerContext] = {}
+        self._watch_tasks: Dict[str, asyncio.Task] = {}
 
     def __getitem__(self, logger_name: str):
         return self._streams[logger_name]
@@ -27,7 +30,7 @@ class Logger:
         name: str | None = None,
         template: str | None = None,
         path: str | None = None,
-        rotation_schedule: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
     ):
         if name is None:
             name = 'default'
@@ -49,7 +52,7 @@ class Logger:
                 template=template,
                 filename=filename,
                 directory=directory,
-                rotation_schedule=rotation_schedule,
+                retention_policy=retention_policy,
             )
 
         return self._contexts[name]
@@ -59,7 +62,7 @@ class Logger:
         name: str | None = None,
         template: str | None = None,
         path: str | None = None,
-        rotation_schedule: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
     ):
         if name is None:
             name = 'default'
@@ -79,8 +82,7 @@ class Logger:
             template=template,
             filename=filename,
             directory=directory,
-            rotation_schedule=rotation_schedule
-            
+            retention_policy=retention_policy,
         )
         
         await stream.initialize()
@@ -95,7 +97,7 @@ class Logger:
         name: str | None = None,
         template: str | None = None,
         path: str | None = None,
-        rotation_schedule: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
     ):
         filename: str | None = None
         directory: str | None = None
@@ -116,7 +118,7 @@ class Logger:
                 template=template,
                 filename=filename,
                 directory=directory,
-                rotation_schedule=rotation_schedule
+                retention_policy=retention_policy,
             )
             await stream.initialize()
             self._streams[name] = stream
@@ -127,7 +129,7 @@ class Logger:
                 template=template,
                 filename=filename,
                 directory=directory,
-                rotation_schedule=rotation_schedule
+                retention_policy=retention_policy,
             )
 
             await stream.initialize()
@@ -139,7 +141,7 @@ class Logger:
                 template=template,
                 filename=filename,
                 directory=directory,
-                rotation_schedule=rotation_schedule,
+                retention_policy=retention_policy
             )
 
             await self._contexts[name].stream.initialize()
@@ -150,7 +152,7 @@ class Logger:
                 template=template,
                 filename=filename,
                 directory=directory,
-                rotation_schedule=rotation_schedule,
+                retention_policy=retention_policy,
             )
 
             await logger._contexts[name].stream.initialize()
@@ -158,10 +160,87 @@ class Logger:
         logger._streams[name]._provider.subscribe(self._streams[name]._consumer)
         logger._contexts[name].stream._provider.subscribe(self._contexts[name].stream._consumer)
 
+    def watch(
+        self, 
+        name: str | None = None,
+        filter: Callable[[T], bool] | None = None,
+    ):
+
+        if name is None:
+            name = 'default'
+
+        if self._watch_tasks.get(name):
+            try:
+                self._watch_tasks[name].cancel()
+
+            except (
+                asyncio.CancelledError,
+                asyncio.InvalidStateError
+            ):
+                pass
+
+        self._watch_tasks[name] = asyncio.create_task(
+            self._watch(
+                name,
+                filter=filter,
+            )
+        )
+        
+    async def put(
+        self,
+        entry: T,
+        name: str | None = None,
+    ):
+        if name is None:
+            name = 'default'
+
+        await self._contexts[name].stream.put(entry)
+
+
+    async def _watch(
+        self, 
+        name: str,
+        filter: Callable[[T], bool] | None = None,
+    ):
+        async with self._contexts[name] as ctx:
+            async for log in ctx.get(
+                filter=filter
+            ):
+                await ctx.log(log.entry)
+
+    async def stop_watch(
+        self,
+        name: str | None = None
+    ):
+        
+        if name is None:
+            name = 'default'
+            
+        if (
+            context := self._contexts.get(name)
+        ) and (
+            watch_task := self._watch_tasks.get(name)
+        ):
+            await context.stream.close(shutdown_subscribed=True)
+            
+            try:
+                await watch_task
+
+            except (
+                asyncio.CancelledError,
+                asyncio.InvalidStateError,
+            ):
+                pass
+
     async def close(
         self,
         shutdown_subscribed: bool = False
     ):
+    
+        if len(self._watch_tasks) > 0:
+            await asyncio.gather(*[
+                self.stop_watch(name) for name in self._watch_tasks
+            ])
 
         streams_count = len(self._streams)
 
@@ -173,6 +252,7 @@ class Logger:
             ])
 
         contexts_count = len(self._contexts)
+
 
         if contexts_count > 0:
             await asyncio.gather(*[
@@ -188,6 +268,7 @@ class Logger:
 
         for context in self._contexts.values():
             context.stream.abort()
+            
 
 
 

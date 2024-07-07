@@ -5,6 +5,7 @@ from typing import (
     TypeVar, 
     Callable,
 )
+from .consumer_status import ConsumerStatus
 
 
 T = TypeVar('T')
@@ -13,63 +14,75 @@ T = TypeVar('T')
 class LogConsumer:
 
     def __init__(self) -> None:
-        self._running = False
         self._queue: asyncio.Queue[Log] = asyncio.Queue()
         self._wait_task: asyncio.Task | None = None
         self._loop = asyncio.get_event_loop()
-        self._shutdown = False
+        self._pending_waiter: asyncio.Future | None = None
+        self._yield_lock = asyncio.Lock()
+        self.status = ConsumerStatus.READY
 
-    async def __aiter__(self) -> AsyncGenerator[Log, None]:
-        self._running = True
-        while self._running:
-            self._wait_task = asyncio.create_task(self._queue.get())
+    @property
+    def pending(self):
+        return self._queue.qsize() > 0
 
-            yield await self._wait_task
-
-        remaining = self._queue.qsize()
-
-        for _ in range(remaining):
-            self._wait_task = asyncio.create_task(self._queue.get())
-            yield await self._wait_task
+    async def wait_for_pending(self):
+        if self.status == ConsumerStatus.CLOSING:
+            self._pending_waiter = asyncio.Future()
+            await self._pending_waiter
 
     async def iter_logs(
         self,
-        filter: Callable[[T], bool] | None = None
+        filter: Callable[[T], bool] | None = None,
     ) -> AsyncGenerator[Log, None]:
-        self._running = True
-        while self._running:
-            self._wait_task = asyncio.create_task(self._queue.get())
 
-            log: Log = await self._wait_task
+        if self.status == ConsumerStatus.READY:
+            self.status =  ConsumerStatus.RUNNING
 
-            if filter and filter(log.entry):
-                yield log
+        try:
+            
+            while self.status == ConsumerStatus.RUNNING:
+                self._wait_task = asyncio.create_task(self._queue.get())
 
-            elif filter is None:
-                yield log
+                log: Log = await self._wait_task
 
-            else:
-                self._queue.put_nowait(log)
+                if filter and filter(log.entry):
+                    yield log
+
+                elif filter is None:
+                    yield log
+
+                else:
+                    self._queue.put_nowait(log)
+
+        except (
+            asyncio.CancelledError,
+            asyncio.InvalidStateError
+        ):
+            pass
 
         remaining = self._queue.qsize()
 
-        for _ in range(remaining):
-            self._wait_task = asyncio.create_task(self._queue.get())
-            log: Log = await self._wait_task
+        if self.status == ConsumerStatus.CLOSING:
+            for _ in range(remaining):
+                self._wait_task = asyncio.create_task(self._queue.get())
+                log: Log = await self._wait_task
 
-            if filter and filter(log.entry):
-                yield log
+                if filter and filter(log.entry):
+                    yield log
 
-            elif filter is None:
-                yield log
+                elif filter is None:
+                    yield log
 
-            else:
-                self._queue.put_nowait(log)
+        if self._pending_waiter and not self._pending_waiter.done():
+            self._pending_waiter.set_result(None)
 
-    def put(self, log: Log):
-        self._queue.put_nowait(log)
+        self.status = ConsumerStatus.CLOSED
+
+    async def put(self, log: Log):
+        await self._queue.put(log)
 
     def abort(self):
+        self.status = ConsumerStatus.ABORTING
         if self._wait_task:
             
             try:
@@ -84,10 +97,19 @@ class LogConsumer:
         remaining = self._queue.qsize()
         for _ in range(remaining):
             self._queue.get_nowait()
+
+        self.status = ConsumerStatus.CLOSED
         
-        self._running = False
    
     def stop(self):
-        self._running = False
+        self.status = ConsumerStatus.CLOSING
 
-    
+        if self._queue.qsize() < 1 and self._wait_task:
+            try:
+                self._wait_task.cancel()
+
+            except (
+                asyncio.CancelledError,
+                asyncio.InvalidStateError,
+            ):
+                pass

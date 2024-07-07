@@ -1,9 +1,12 @@
 import asyncio
 import os
 
-from async_logging.rotation import TimeParser
-from typing import Callable, TypeVar
+from typing import TypeVar
 from .logger_stream import LoggerStream
+from .retention_policy import (
+    RetentionPolicy,
+    RetentionPolicyConfig,
+)
 
 
 T = TypeVar('T')
@@ -16,19 +19,19 @@ class LoggerContext:
         template: str | None = None,
         filename: str | None = None,
         directory: str | None = None,
-        rotation_schedule: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
     ) -> None:
         self.name = name
         self.template = template
         self.filename = filename
         self.directory = directory
-        self.rotation_schedule = rotation_schedule
+        self.retention_policy = retention_policy
         self.stream = LoggerStream(
             name=name,
             template=template,
             filename=filename,
             directory=directory,
-            rotation_schedule=rotation_schedule,
+            retention_policy=retention_policy,
         )
 
     async def __aenter__(self):
@@ -42,19 +45,22 @@ class LoggerContext:
                 self.filename,
                 directory=self.directory,
                 is_default=True,
-                rotation_schedule=self.rotation_schedule,
+                rotation_schedule=self.retention_policy,
             )
 
-        if self.rotation_schedule and self.filename is None:
+        if self.retention_policy and self.filename is None:
+
             filename = "logs.json"
             directory = os.path.join(self.stream._cwd, "logs")
             logfile_path = os.path.join(directory, filename)
 
-            self.stream._rotation_schedules[logfile_path] = TimeParser(
-                self.rotation_schedule
-            ).time
+            policy = RetentionPolicy(self.retention_policy)
+            policy.parse()
+
+            self.stream._retention_policies[logfile_path] = policy
 
         return self.stream
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+
         await self.stream.close()

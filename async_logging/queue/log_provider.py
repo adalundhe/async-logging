@@ -2,6 +2,8 @@ import asyncio
 from async_logging.models import Log
 from typing import List
 from .log_consumer import LogConsumer
+from .consumer_status import ConsumerStatus
+from .provider_status import ProviderStatus
 
 
 class LogProvider:
@@ -10,18 +12,39 @@ class LogProvider:
         self._close_waiter: asyncio.Future | None = None
         self.closing: bool = False
         self._consumers: List[LogConsumer] = []
+        self.status = ProviderStatus.READY
 
     def subscribe(self, consumer: LogConsumer):
-        self._consumers.append(consumer)
-    
-    def put(self, log: Log):
-        for consumer in self._consumers:
-            consumer.put(log)
+
+        if self.status == ProviderStatus.READY:
+            self.status = ProviderStatus.RUNNING
+
+        if self.status == ProviderStatus.RUNNING:
+            self._consumers.append(consumer)
+
+    async def put(self, log: Log):
+
+        if self.status == ProviderStatus.RUNNING:
+            await asyncio.gather(*[
+                consumer.put(log) for consumer in self._consumers if consumer.status in [
+                    ConsumerStatus.READY,
+                    ConsumerStatus.RUNNING,
+                ]
+            ])
+                    
+
+        await asyncio.sleep(0)
 
     async def signal_shutdown(self):
+        self.status = ProviderStatus.CLOSING
 
         for consumer in self._consumers:
             consumer.stop()
+
+            if consumer.pending:
+                await consumer.wait_for_pending()
+
+        self.status = ProviderStatus.CLOSED
 
 
 

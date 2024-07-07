@@ -1,5 +1,4 @@
 import asyncio
-import signal
 import datetime
 import io
 import os
@@ -8,46 +7,32 @@ import sys
 import threading
 import uuid
 from collections import defaultdict
-from typing import Dict, Callable, TypeVar
+from typing import (
+    Dict, 
+    Callable, 
+    TypeVar, 
+)
 
 import msgspec
 import zstandard
 
 from async_logging.config.logging_config import LoggingConfig
 from async_logging.models import Entry, LogLevel, Log
-from async_logging.rotation import TimeParser
 from async_logging.snowflake import SnowflakeGenerator
 from async_logging.queue import (
     LogProvider,
     LogConsumer,
 )
-
+from async_logging.queue import ConsumerStatus
 
 from .protocol import LoggerProtocol
 from .stream_type import StreamType
-
+from .retention_policy import (
+    RetentionPolicy,
+    RetentionPolicyConfig,
+)
 
 T = TypeVar('T', bound=Entry)
-
-
-def anchor():
-    """
-    Ordinarily we would use __file__ for this, but frozen modules don't always
-    have __file__ set, for some reason (see Issue logging#21736). Thus, we get
-    the filename from a handy code object from a function defined in this
-    module.
-    """
-    raise NotImplementedError(
-        "I shouldn't be called. My only purpose is to provide "
-        "the filename from a handy code object."
-    )
-
-
-# _srcfile is used when walking the stack to check when we've got the first
-# caller stack frame, by skipping frames whose filename is that of this
-# module's source. It therefore should contain the filename of this module's
-# source file.
-_srcfile = anchor.__code__.co_filename
 
 
 class LoggerStream:
@@ -57,7 +42,7 @@ class LoggerStream:
         template: str | None = None,
         filename: str | None = None,
         directory: str | None = None,
-        rotation_schedule: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
     ) -> None:
         if name is None:
             name = "default"
@@ -66,7 +51,11 @@ class LoggerStream:
         self._default_template = template
         self._default_logfile = filename
         self._default_log_directory = directory
-        self._default_rotation_schedule = rotation_schedule
+
+        self._default_retention_policy = retention_policy
+        if retention_policy:
+            self._default_retention_policy = RetentionPolicy(retention_policy)
+            self._default_retention_policy.parse()
 
         self._stdout: io.TextIO | None = None
         self._stderr: io.TextIO | None = None
@@ -80,7 +69,9 @@ class LoggerStream:
         self._file_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._cwd: str | None = None
         self._default_logfile_path: str | None = None
-        self._rotation_schedules: Dict[str, float] = {}
+
+        self._retention_policies: Dict[str, RetentionPolicy] = {}
+        
         self._config = LoggingConfig()
         self._initialized: bool = False
         self._consumer: LogConsumer | None = None
@@ -90,36 +81,36 @@ class LoggerStream:
         self._stderr: io.TextIOBase | None = None
         self._stdout: io.TextIOBase | None = None
 
-
     async def initialize(self) -> asyncio.StreamWriter:
-        
-        if self._initialized:
-            return
-
-        if self._generator is None:
-            self._generator = SnowflakeGenerator(
-                (uuid.uuid1().int + threading.get_native_id()) >> 64
-            )
-
-        if self._compressor is None:
-            self._compressor = zstandard.ZstdCompressor()
-
-        if self._loop is None:
-            self._loop = asyncio.get_event_loop()
-
-        if self._consumer is None:
-            self._consumer = LogConsumer()
-
-        if self._provider is None:
-            self._provider = LogProvider()
-
-        if self._stdout is None:
-            self._stdout = sys.stdout
-
-        if self._stderr is None:
-            self._stderr = sys.stderr
 
         async with self._init_lock:
+            
+            if self._initialized:
+                return
+
+            if self._generator is None:
+                self._generator = SnowflakeGenerator(
+                    (uuid.uuid1().int + threading.get_native_id()) >> 64
+                )
+
+            if self._compressor is None:
+                self._compressor = zstandard.ZstdCompressor()
+
+            if self._loop is None:
+                self._loop = asyncio.get_event_loop()
+
+            if self._consumer is None:
+                self._consumer = LogConsumer()
+
+            if self._provider is None:
+                self._provider = LogProvider()
+
+            if self._stdout is None:
+                self._stdout = sys.stdout
+
+            if self._stderr is None:
+                self._stderr = sys.stderr
+
             if self._stream_writers.get(StreamType.STDOUT) is None:
                 transport, protocol = await self._loop.connect_write_pipe(
                     lambda: LoggerProtocol(), self._stdout
@@ -144,14 +135,14 @@ class LoggerStream:
                     self._loop,
                 )
         
-        self._initialized = True
+            self._initialized = True
 
     async def open_file(
         self,
         filename: str,
         directory: str | None = None,
         is_default: bool = False,
-        rotation_schedule: str = None,
+        retention_policy: RetentionPolicyConfig | None = None,
     ):
         if self._cwd is None:
             self._cwd = await asyncio.to_thread(os.getcwd)
@@ -166,13 +157,20 @@ class LoggerStream:
 
         self._file_locks[logfile_path].release()
 
-        if rotation_schedule and self._rotation_schedules.get(logfile_path) is None:
-            self._rotation_schedules[logfile_path] = TimeParser(rotation_schedule).time
+        if retention_policy and self._retention_policies.get(logfile_path) is None:
+
+            policy = RetentionPolicy(retention_policy)
+            policy.parse()
+
+            self._retention_policies[logfile_path] = policy
 
         if is_default:
             self._default_logfile_path = logfile_path
 
-    def _open_file(self, logfile_path: str):
+    def _open_file(
+        self, 
+        logfile_path: str,
+    ):
         resolved_path = pathlib.Path(logfile_path).absolute().resolve()
         logfile_directory = str(resolved_path.parent)
         path = str(resolved_path)
@@ -188,11 +186,12 @@ class LoggerStream:
     async def _rotate(
         self,
         logfile_path: str,
+        retention_policy: RetentionPolicy
     ):
         await self._file_locks[logfile_path].acquire()
         await asyncio.to_thread(
             self._rotate_logfile,
-            self._rotation_schedules[logfile_path],
+            retention_policy,
             logfile_path,
         )
 
@@ -227,7 +226,7 @@ class LoggerStream:
 
     def _rotate_logfile(
         self,
-        rotation_max_age: float,
+        retention_policy: RetentionPolicy,
         logfile_path: str,
     ):
         resolved_path = pathlib.Path(logfile_path)
@@ -235,43 +234,65 @@ class LoggerStream:
 
         logfile_metadata = self._get_logfile_metadata(logfile_path)
 
+        current_time = datetime.datetime.now(datetime.UTC)
+        current_timestamp = current_time.timestamp()
+
         created_time = logfile_metadata.get(
-            logfile_path, datetime.datetime.now().timestamp()
+            logfile_path, 
+            current_timestamp,
         )
 
-        file_age_seconds = datetime.datetime.now().timestamp() - created_time
+        archived_filename = f"{resolved_path.stem}_{current_timestamp}_archived.zst"
         logfile_data = b""
-
-        if file_age_seconds >= rotation_max_age:
+        
+        if retention_policy.matches_policy({
+            "file_age": (
+                current_time - datetime.datetime.fromtimestamp(created_time, datetime.UTC)
+            ).seconds,
+            "file_size": os.path.getsize(logfile_path),
+            "logfile_path": resolved_path
+        }) is False:
             self._files[logfile_path].close()
 
-            with open(path, "rb") as logfile:
-                logfile_data = self._compressor.compress(logfile.read())
+            with open(logfile_path, 'rb') as logfile:
+                logfile_data = logfile.read()
 
         if len(logfile_data) > 0:
-            timestamp = datetime.datetime.now().timestamp()
-            archived_filename = f"{resolved_path.stem}_{timestamp}_archived.zst"
             archive_path = os.path.join(
                 str(resolved_path.parent.absolute().resolve()),
                 archived_filename,
             )
 
             with open(archive_path, "wb") as archived_file:
-                archived_file.write(logfile_data)
+                archived_file.write(
+                    self._compressor.compress(logfile_data)
+                )
 
             self._files[logfile_path] = open(path, "wb+")
-            created_time = datetime.datetime.now().timestamp()
+            created_time = current_timestamp
 
         logfile_metadata[logfile_path] = created_time
 
         self._update_logfile_metadata(logfile_path, logfile_metadata)
 
-    async def close(self, shutdown_subscribed: bool = False):
 
+    async def close(
+        self, 
+        shutdown_subscribed: bool = False
+    ):
+
+        self._consumer.stop()
+        
         if shutdown_subscribed:
-            self._consumer.stop()
             await self._provider.signal_shutdown()
 
+        if self._consumer.status in  [
+            ConsumerStatus.RUNNING,
+            ConsumerStatus.CLOSING,
+        ] and self._consumer.pending:
+            await self._consumer.wait_for_pending()
+
+            
         await asyncio.gather(
             *[self._close_file(logfile_path) for logfile_path in self._files]
         )
@@ -344,7 +365,7 @@ class LoggerStream:
         entry: T,
         template: str | None = None,
         path: str | None = None,
-        rotation_schedule: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
         filter: Callable[[T], bool] | None=None,
 ):
         filename: str | None = None
@@ -366,15 +387,15 @@ class LoggerStream:
         if directory is None:
             directory = self._default_log_directory
 
-        if rotation_schedule is None:
-            rotation_schedule = self._default_rotation_schedule
+        if retention_policy is None:
+            retention_policy = self._default_retention_policy
 
         if filename or directory:
             await self._log_to_file(
                 entry,
                 filename=filename,
                 directory=directory,
-                rotation_schedule=rotation_schedule,
+                retention_policy=retention_policy,
                 filter=filter,
             )
 
@@ -461,7 +482,7 @@ class LoggerStream:
         entry: T,
         filename: str | None = None,
         directory: str | None = None,
-        rotation_schedule: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
         filter: Callable[[T], bool] | None=None,
     ):
         if self._config.enabled(self._name, entry.level) is False:
@@ -493,11 +514,14 @@ class LoggerStream:
                 directory=directory,
             )
 
-        if rotation_schedule:
-            self._rotation_schedules[logfile_path] = TimeParser(rotation_schedule).time
+        if retention_policy:
+            self._retention_policies[logfile_path] = retention_policy
 
-        if self._rotation_schedules.get(logfile_path):
-            await self._rotate(logfile_path)
+        if retention_policy := self._retention_policies.get(logfile_path):
+            await self._rotate(
+                logfile_path,
+                retention_policy,
+            )
 
         log_file, line_number, function_name = self._find_caller()
 
@@ -509,11 +533,17 @@ class LoggerStream:
                 line_number=line_number
             )
 
+            await self._file_locks[logfile_path].acquire()
+
             await asyncio.to_thread(
                 self._write_to_file,
                 log,
                 logfile_path,
             )
+
+            await asyncio.sleep(0)
+
+            self._file_locks[logfile_path].release()
 
         except Exception as err:
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
@@ -544,6 +574,7 @@ class LoggerStream:
         ) and (
             logfile.closed is False
         ):
+            
             logfile.write(msgspec.json.encode(entry) + b"\n")
 
     def _find_caller(self):
@@ -560,20 +591,22 @@ class LoggerStream:
             code.co_name,
         )
     
-    async def receive(
+    async def get(
         self,
         filter: Callable[[T], bool] | None = None
     ):
-        async for log in self._consumer.iter_logs(filter):
+        async for log in self._consumer.iter_logs(
+            filter=filter
+        ):
             yield log
     
-    async def enqueue(
+    async def put(
         self,
         entry: T,
     ):
         log_file, line_number, function_name = self._find_caller()
 
-        self._provider.put(Log(
+        await self._provider.put(Log(
             entry=entry,
             filename=log_file,
             function_name=function_name,

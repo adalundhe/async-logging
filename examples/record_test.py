@@ -1,4 +1,5 @@
 import asyncio
+import time
 from async_logging.models import Entry, LogLevel
 from async_logging.streams import Logger
 
@@ -7,60 +8,41 @@ class TestLog(Entry, kw_only=True):
     value: int
     level: LogLevel = LogLevel.INFO
 
-def filter_test_log(log: TestLog):
-    return log.value > 10
-
-async def read_from_consumer(logger: Logger):
-
-
-    async with logger.create_context(
-        template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message} and {value}"
-    ) as ctx:
-        async for log in ctx.receive(
-            filter=filter_test_log
-        ):
-            await ctx.log(log.entry)
-
-async def provide(logger: Logger):
-
-
-    async with logger.create_context() as ctx:
-        await ctx.enqueue(TestLog(message="Hello!", value=10))
-        await ctx.enqueue(TestLog(message="Hello!", value=20))
-        await ctx.enqueue(TestLog(message="Hello!", value=10))
-
-    await logger.close(shutdown_subscribed=True)
 
 async def test_entry():
     try:
         provider = Logger()
         consumer = Logger()
 
-        await consumer.subscribe(provider)
-
-        consumer_task = asyncio.create_task(
-            read_from_consumer(consumer)
+        await consumer.subscribe(
+            provider,
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message} and {value}",
+            path="/logs",
+            retention_policy={
+                "max_age": "1h",
+                "max_size": "100mb",
+                "rotation_time": "12:27"
+            }
         )
 
-        provider_task = asyncio.create_task(
-            provide(provider)
-        )
+        consumer.watch()
 
+        start = time.monotonic()
         
-        await asyncio.gather(*[
-            consumer_task,
-            provider_task,
-        ])
+        async with provider.create_context() as ctx:
+            await asyncio.gather(*[
+                ctx.put(TestLog(message="Hello!", value=20)) for _ in range(10)
+            ])
+
+        await provider.close()
+        await consumer.close()
+
+        print('TOOK: ', time.monotonic() - start)
 
     except KeyboardInterrupt:
         provider.abort()
         consumer.abort()
 
-        consumer_task.cancel()
-        provider_task.cancel()
-
-
-    
 
 if __name__ == "__main__":
     
@@ -68,4 +50,4 @@ if __name__ == "__main__":
         asyncio.run(test_entry())
 
     except KeyboardInterrupt:
-        print('EEE')
+        pass
