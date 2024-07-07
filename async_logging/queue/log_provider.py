@@ -14,6 +14,10 @@ class LogProvider:
         self._consumers: List[LogConsumer] = []
         self.status = ProviderStatus.READY
 
+    @property
+    def subscriptions_count(self):
+        return len(self._consumers)
+
     def subscribe(self, consumer: LogConsumer):
 
         if self.status == ProviderStatus.READY:

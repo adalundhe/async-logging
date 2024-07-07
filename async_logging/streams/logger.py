@@ -8,6 +8,10 @@ from typing import (
 )
 import pathlib
 from async_logging.models import Entry
+from async_logging.queue import (
+    ConsumerStatus,
+    ProviderStatus,
+)
 from .logger_stream import LoggerStream
 from .logger_context import LoggerContext
 from .retention_policy import RetentionPolicyConfig
@@ -232,10 +236,7 @@ class Logger:
             ):
                 pass
 
-    async def close(
-        self,
-        shutdown_subscribed: bool = False
-    ):
+    async def close(self):
     
         if len(self._watch_tasks) > 0:
             await asyncio.gather(*[
@@ -243,6 +244,12 @@ class Logger:
             ])
 
         streams_count = len(self._streams)
+
+        shutdown_subscribed = len([
+            stream for stream in self._streams.values() if stream.has_active_subscriptions
+        ]) > 0 or len([
+            context for context in self._contexts.values() if context.stream.has_active_subscriptions
+        ])
 
         if streams_count > 0:
             await asyncio.gather(*[

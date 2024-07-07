@@ -81,6 +81,10 @@ class LoggerStream:
         self._stderr: io.TextIOBase | None = None
         self._stdout: io.TextIOBase | None = None
 
+    @property
+    def has_active_subscriptions(self):
+        return self._provider.subscriptions_count > 0
+
     async def initialize(self) -> asyncio.StreamWriter:
 
         async with self._init_lock:

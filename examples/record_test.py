@@ -1,5 +1,4 @@
 import asyncio
-import time
 from async_logging.models import Entry, LogLevel
 from async_logging.streams import Logger
 
@@ -26,18 +25,12 @@ async def test_entry():
         )
 
         consumer.watch()
-
-        start = time.monotonic()
         
-        async with provider.create_context() as ctx:
-            await asyncio.gather(*[
-                ctx.put(TestLog(message="Hello!", value=20)) for _ in range(10)
-            ])
+        await asyncio.gather(*[
+            provider.put(TestLog(message="Hello!", value=20)) for _ in range(10**5)
+        ])
 
         await provider.close()
-        await consumer.close()
-
-        print('TOOK: ', time.monotonic() - start)
 
     except KeyboardInterrupt:
         provider.abort()
