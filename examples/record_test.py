@@ -20,18 +20,9 @@ async def test_entry():
 
         consumer.watch()
 
-        await provider.batch(
-            TestLog(message="Hello!", value=20),
-            TestLog(message="Hello!", value=20),
-            TestLog(message="Hello!", value=20),
-            TestLog(message="Hello!", value=20),
-            TestLog(message="Hello!", value=20),
-            TestLog(message="Hello!", value=20),
-            TestLog(message="Hello!", value=20),
-            TestLog(message="Hello!", value=20),
-            TestLog(message="Hello!", value=20),
-            TestLog(message="Hello!", value=20),
-        )
+        await provider.batch(*[
+            TestLog(message="Hello!", value=20) for _ in range(10**5)
+        ])
 
         await provider.close()
 
