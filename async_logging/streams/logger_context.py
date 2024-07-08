@@ -62,5 +62,4 @@ class LoggerContext:
         return self.stream
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-
-        await self.stream.close()
+        pass

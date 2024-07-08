@@ -25,10 +25,10 @@ async def test_entry():
         )
 
         consumer.watch()
-        
-        await asyncio.gather(*[
-            provider.put(TestLog(message="Hello!", value=20)) for _ in range(10**5)
-        ])
+
+        async with provider.create_context() as ctx:
+            for _ in range(10):
+                await ctx.put(TestLog(message="Hello!", value=20))
 
         await provider.close()
 

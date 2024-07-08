@@ -1,10 +1,15 @@
 import msgspec
 import threading
 import datetime
+from typing import Generic, TypeVar
+from .entry import Entry
 
 
-class Log(msgspec.Struct, kw_only=True):
-    entry: msgspec.Struct
+T = TypeVar('T')
+
+
+class Log(msgspec.Struct, Generic[T], kw_only=True):
+    entry: Entry
     filename: str
     function_name: str
     line_number: int

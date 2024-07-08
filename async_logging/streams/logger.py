@@ -8,10 +8,6 @@ from typing import (
 )
 import pathlib
 from async_logging.models import Entry
-from async_logging.queue import (
-    ConsumerStatus,
-    ProviderStatus,
-)
 from .logger_stream import LoggerStream
 from .logger_context import LoggerContext
 from .retention_policy import RetentionPolicyConfig
@@ -189,17 +185,6 @@ class Logger:
                 filter=filter,
             )
         )
-        
-    async def put(
-        self,
-        entry: T,
-        name: str | None = None,
-    ):
-        if name is None:
-            name = 'default'
-
-        await self._contexts[name].stream.put(entry)
-
 
     async def _watch(
         self, 
@@ -210,7 +195,7 @@ class Logger:
             async for log in ctx.get(
                 filter=filter
             ):
-                await ctx.log(log.entry)
+                await ctx.log(log)
 
     async def stop_watch(
         self,

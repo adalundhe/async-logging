@@ -32,6 +32,7 @@ from .retention_policy import (
     RetentionPolicyConfig,
 )
 
+
 T = TypeVar('T', bound=Entry)
 
 
@@ -412,10 +413,18 @@ class LoggerStream:
 
     async def _log(
         self,
-        entry: T,
+        entry_or_log: T | Log[T],
         template: str | None = None,
         filter: Callable[[T], bool] | None=None,
     ):
+
+        entry: Entry = None
+        if isinstance(entry_or_log, Log):
+            entry = entry_or_log.entry
+
+        else:
+            entry = entry_or_log
+
         stream = (
             StreamType.STDOUT
             if entry.level
@@ -438,13 +447,19 @@ class LoggerStream:
 
         stream_writer = self._stream_writers[stream]
 
+        if stream_writer.is_closing():
+            return
+
         if template is None:
             template = "{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}"
 
-        log_file, line_number, function_name = self._find_caller()
+        if isinstance(entry_or_log, Log):
+            log_file = entry_or_log.filename
+            line_number = entry_or_log.line_number
+            function_name = entry_or_log.function_name
 
-        if stream_writer.is_closing():
-            return
+        else:
+            log_file, line_number, function_name = self._find_caller()
 
         try:
             stream_writer.write(
@@ -460,6 +475,7 @@ class LoggerStream:
                 ).encode()
                 + b"\n"
             )
+            
             await stream_writer.drain()
 
         except Exception as err:
@@ -483,12 +499,20 @@ class LoggerStream:
 
     async def _log_to_file(
         self,
-        entry: T,
+        entry_or_log: T  | Log[T],
         filename: str | None = None,
         directory: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
         filter: Callable[[T], bool] | None=None,
     ):
+        
+        entry: Entry = None
+        if isinstance(entry_or_log, Log):
+            entry = entry_or_log.entry
+
+        else:
+            entry = entry_or_log
+
         if self._config.enabled(self._name, entry.level) is False:
             return
 
@@ -527,9 +551,16 @@ class LoggerStream:
                 retention_policy,
             )
 
-        log_file, line_number, function_name = self._find_caller()
+        if isinstance(entry_or_log, Log):
+            log_file = entry_or_log.filename
+            line_number = entry_or_log.line_number
+            function_name = entry_or_log.function_name
 
-        try:
+            log = entry_or_log
+
+        else:
+            log_file, line_number, function_name = self._find_caller()
+
             log = Log(
                 entry=entry,
                 filename=log_file,
@@ -537,6 +568,7 @@ class LoggerStream:
                 line_number=line_number
             )
 
+        try:
             await self._file_locks[logfile_path].acquire()
 
             await asyncio.to_thread(
@@ -608,13 +640,15 @@ class LoggerStream:
         self,
         entry: T,
     ):
-        log_file, line_number, function_name = self._find_caller()
+
+        frame = sys._getframe(1)
+        code = frame.f_code
 
         await self._provider.put(Log(
             entry=entry,
-            filename=log_file,
-            function_name=function_name,
-            line_number=line_number,
+            filename=code.co_filename,
+            function_name=code.co_name,
+            line_number=frame.f_lineno,
             thread_id=threading.get_native_id(),
             timestamp=datetime.datetime.now(datetime.UTC).isoformat()
         ))
