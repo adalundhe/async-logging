@@ -55,6 +55,13 @@ class Logger:
                 retention_policy=retention_policy,
             )
 
+        else:
+            self._contexts[name].name = name if name else self._contexts[name].name
+            self._contexts[name].template = template if template else self._contexts[name].template
+            self._contexts[name].filename = filename if filename else self._contexts[name].filename
+            self._contexts[name].directory = directory if directory else self._contexts[name].directory
+            self._contexts[name].retention_policy = retention_policy if retention_policy else self._contexts[name].retention_policy
+
         return self._contexts[name]
     
     async def create(
@@ -126,10 +133,6 @@ class Logger:
         if logger._streams.get(name) is None:
             stream = LoggerStream(
                 name=name,
-                template=template,
-                filename=filename,
-                directory=directory,
-                retention_policy=retention_policy,
             )
 
             await stream.initialize()
@@ -149,10 +152,6 @@ class Logger:
         if logger._contexts.get(name) is None:
             logger._contexts[name] = LoggerContext(
                 name=name,
-                template=template,
-                filename=filename,
-                directory=directory,
-                retention_policy=retention_policy,
             )
 
             await logger._contexts[name].stream.initialize()

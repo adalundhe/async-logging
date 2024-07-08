@@ -376,6 +376,7 @@ class LoggerStream:
         filename: str | None = None
         directory: str | None = None
 
+
         if path:
             logfile_path = pathlib.Path(path)
             is_logfile = len(logfile_path.suffix) > 0 

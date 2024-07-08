@@ -26,9 +26,13 @@ async def test_entry():
 
         consumer.watch()
 
-        async with provider.create_context() as ctx:
+        async with provider.create_context(
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message} and {value}",
+        ) as ctx:
             for _ in range(10):
-                await ctx.put(TestLog(message="Hello!", value=20))
+                entry = TestLog(message="Hello!", value=20)
+                await ctx.put(entry)
+                await ctx.log(entry)
 
         await provider.close()
 
