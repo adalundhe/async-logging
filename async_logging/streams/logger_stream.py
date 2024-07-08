@@ -639,17 +639,20 @@ class LoggerStream:
     
     async def put(
         self,
-        entry: T,
+        entry: T | Log[T],
     ):
+        
+        if not isinstance(entry, Log):
 
-        frame = sys._getframe(1)
-        code = frame.f_code
+            frame = sys._getframe(1)
+            code = frame.f_code
+            entry = Log(
+                entry=entry,
+                filename=code.co_filename,
+                function_name=code.co_name,
+                line_number=frame.f_lineno,
+                thread_id=threading.get_native_id(),
+                timestamp=datetime.datetime.now(datetime.UTC).isoformat()
+            )
 
-        await self._provider.put(Log(
-            entry=entry,
-            filename=code.co_filename,
-            function_name=code.co_name,
-            line_number=frame.f_lineno,
-            thread_id=threading.get_native_id(),
-            timestamp=datetime.datetime.now(datetime.UTC).isoformat()
-        ))
+        await self._provider.put(entry)

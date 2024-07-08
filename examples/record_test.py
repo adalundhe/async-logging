@@ -16,23 +16,22 @@ async def test_entry():
         await consumer.subscribe(
             provider,
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message} and {value}",
-            path="/logs",
-            retention_policy={
-                "max_age": "1h",
-                "max_size": "100mb",
-                "rotation_time": "12:27"
-            }
         )
 
         consumer.watch()
 
-        async with provider.create_context(
-            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message} and {value}",
-        ) as ctx:
-            for _ in range(10):
-                entry = TestLog(message="Hello!", value=20)
-                await ctx.put(entry)
-                await ctx.log(entry)
+        await provider.batch(
+            TestLog(message="Hello!", value=20),
+            TestLog(message="Hello!", value=20),
+            TestLog(message="Hello!", value=20),
+            TestLog(message="Hello!", value=20),
+            TestLog(message="Hello!", value=20),
+            TestLog(message="Hello!", value=20),
+            TestLog(message="Hello!", value=20),
+            TestLog(message="Hello!", value=20),
+            TestLog(message="Hello!", value=20),
+            TestLog(message="Hello!", value=20),
+        )
 
         await provider.close()
 
