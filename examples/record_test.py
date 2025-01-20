@@ -20,9 +20,9 @@ async def test_entry():
 
         consumer.watch()
 
-        await provider.batch(*[
-            TestLog(message="Hello!", value=20) for _ in range(10**5)
-        ])
+        await provider.batch(
+            *[TestLog(message="Hello!", value=20) for _ in range(10**5)]
+        )
 
         await provider.close()
 
@@ -32,7 +32,6 @@ async def test_entry():
 
 
 if __name__ == "__main__":
-    
     try:
         asyncio.run(test_entry())
 
