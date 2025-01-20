@@ -1,8 +1,10 @@
 import asyncio
-from async_logging.models import Log
 from typing import List
-from .log_consumer import LogConsumer
+
+from async_logging.models import Log
+
 from .consumer_status import ConsumerStatus
+from .log_consumer import LogConsumer
 from .provider_status import ProviderStatus
 
 

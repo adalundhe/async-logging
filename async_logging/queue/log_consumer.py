@@ -1,12 +1,13 @@
 import asyncio
-from async_logging.models import Log
 from typing import (
-    AsyncGenerator, 
-    TypeVar, 
+    AsyncGenerator,
     Callable,
+    TypeVar,
 )
-from .consumer_status import ConsumerStatus
 
+from async_logging.models import Log
+
+from .consumer_status import ConsumerStatus
 
 T = TypeVar('T')
 

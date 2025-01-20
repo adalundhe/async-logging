@@ -8,32 +8,48 @@ import threading
 import uuid
 from collections import defaultdict
 from typing import (
-    Dict, 
-    Callable, 
-    TypeVar, 
+    Callable,
+    Dict,
+    List,
+    TypeVar,
 )
 
 import msgspec
 import zstandard
 
 from async_logging.config.logging_config import LoggingConfig
-from async_logging.models import Entry, LogLevel, Log
-from async_logging.snowflake import SnowflakeGenerator
+from async_logging.models import Entry, Log, LogLevel
 from async_logging.queue import (
-    LogProvider,
+    ConsumerStatus,
     LogConsumer,
+    LogProvider,
 )
-from async_logging.queue import ConsumerStatus
+from async_logging.snowflake import SnowflakeGenerator
 
 from .protocol import LoggerProtocol
-from .stream_type import StreamType
 from .retention_policy import (
     RetentionPolicy,
     RetentionPolicyConfig,
 )
-
+from .stream_type import StreamType
 
 T = TypeVar('T', bound=Entry)
+
+
+def patch_transport_close(
+    transport: asyncio.Transport, 
+    loop: asyncio.AbstractEventLoop,
+):
+
+    def close(*args, **kwargs):
+        try:
+
+            transport.close()
+
+        except Exception:
+            pass
+
+    return close
 
 
 class LoggerStream:
@@ -81,6 +97,7 @@ class LoggerStream:
         self._closed = False
         self._stderr: io.TextIOBase | None = None
         self._stdout: io.TextIOBase | None = None
+        self._transports: List[asyncio.Transport] = []
 
     @property
     def has_active_subscriptions(self):
@@ -121,6 +138,8 @@ class LoggerStream:
                     lambda: LoggerProtocol(), self._stdout
                 )
 
+                transport.close = patch_transport_close(transport, self._loop)
+
                 self._stream_writers[StreamType.STDOUT] = asyncio.StreamWriter(
                     transport,
                     protocol,
@@ -132,6 +151,9 @@ class LoggerStream:
                 transport, protocol = await self._loop.connect_write_pipe(
                     lambda: LoggerProtocol(), self._stderr
                 )
+
+
+                transport.close = patch_transport_close(transport, self._loop)
 
                 self._stream_writers[StreamType.STDERR] = asyncio.StreamWriter(
                     transport,

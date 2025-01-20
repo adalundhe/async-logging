@@ -1,13 +1,13 @@
-import os
-import re
-import glob
-import platform
-import pathlib
-from typing import Dict, Literal, List
 import datetime
+import glob
+import os
+import pathlib
+import re
+from typing import Dict, Literal
+
 from async_logging.rotation import (
-    TimeParser,
     FileSizeParser,
+    TimeParser,
 )
 
 RetentionPolicyConfig = Dict[

@@ -45,7 +45,7 @@ class LoggerContext:
                 self.filename,
                 directory=self.directory,
                 is_default=True,
-                rotation_schedule=self.retention_policy,
+                retention_policy=self.retention_policy,
             )
 
         if self.retention_policy and self.filename is None:
