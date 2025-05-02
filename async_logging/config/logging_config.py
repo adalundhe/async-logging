@@ -12,11 +12,14 @@ _global_log_level = contextvars.ContextVar("_global_log_level", default=LogLevel
 _global_disabled_loggers = contextvars.ContextVar("_global_disabled_loggers", default=[])
 _global_level_map = contextvars.ContextVar("_global_level_map", default=LogLevelMap())
 _global_log_output_type = contextvars.ContextVar("_global_log_level_type", default=StreamType.STDOUT)
-_global_logging_directory = contextvars.ContextVar("_global_logging_directory")
+_global_logging_directory = contextvars.ContextVar("_global_logging_directory", default=None)
 
 
 class LoggingConfig:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        level: LogLevelName | None = None,
+    ) -> None:
         self._log_level: contextvars.ContextVar[LogLevel] = _global_log_level
         self._log_output_type: contextvars.ContextVar[StreamType] = _global_log_output_type
         self._log_directory: contextvars.ContextVar[str | None] = _global_logging_directory
@@ -25,6 +28,7 @@ class LoggingConfig:
             _global_disabled_loggers
         )
         self._level_map = _global_level_map.get()
+        self._level = level
 
     def update(
         self, 
@@ -47,7 +51,11 @@ class LoggingConfig:
 
     def enabled(self, logger_name: str, log_level: LogLevel) -> bool:
         disabled_loggers = self._disabled_loggers.get()
-        current_log_level = self._log_level.get()
+
+        current_log_level = self._level
+        if current_log_level is None:
+            current_log_level = self._log_level.get()
+            
         return logger_name not in disabled_loggers and (
             self._level_map[log_level] >= self._level_map[current_log_level]
         )

@@ -20,7 +20,7 @@ import msgspec
 import zstandard
 
 from async_logging.config.logging_config import LoggingConfig
-from async_logging.models import Entry, Log, LogLevel
+from async_logging.models import Entry, Log, LogLevel, LogLevelName
 from async_logging.queue import (
     ConsumerStatus,
     LogConsumer,
@@ -76,6 +76,7 @@ class LoggerStream:
                 dict[str, Any],
             ]
         ] | None = None,
+        level: LogLevelName | None = None,
     ) -> None:
         if name is None:
             name = "default"
@@ -103,7 +104,9 @@ class LoggerStream:
 
         self._retention_policies: Dict[str, RetentionPolicy] = {}
         
-        self._config = LoggingConfig()
+        self._config = LoggingConfig(
+            level=level,
+        )
         self._initialized: bool = False
         self._consumer: LogConsumer | None = None
         self._provider: LogProvider | None = None

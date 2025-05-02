@@ -12,7 +12,7 @@ from typing import (
     Any
 )
 
-from async_logging.models import Entry, Log
+from async_logging.models import Entry, Log, LogLevelName
 
 from .logger_context import LoggerContext
 from .retention_policy import RetentionPolicyConfig
@@ -44,7 +44,8 @@ class Logger:
                 type[T],
                 dict[str, Any],
             ]
-        ] | None = None,           
+        ] | None = None,  
+        level: LogLevelName | None = None         
     ):
         if name is None:
             name = 'default'
@@ -66,6 +67,7 @@ class Logger:
             directory=directory,
             retention_policy=retention_policy,
             models=models,
+            level=level,
         )
 
         return self._contexts[name].stream
@@ -83,6 +85,7 @@ class Logger:
                 dict[str, Any],
             ]
         ] | None = None,
+        level: LogLevelName | None = None,
     ):
         if name is None:
             name = 'default'
@@ -104,6 +107,7 @@ class Logger:
             directory=directory,
             retention_policy=retention_policy,
             models=models,
+            level=level,
         )
 
     def context(
@@ -120,6 +124,7 @@ class Logger:
                 dict[str, Any],
             ]
         ] | None = None,
+        level: LogLevelName | None = None,
     ):
         if name is None:
             name = 'default'
@@ -144,6 +149,7 @@ class Logger:
                 retention_policy=retention_policy,
                 nested=nested,
                 models=models,
+                level=level,
             )
 
         else:
@@ -170,6 +176,7 @@ class Logger:
                 dict[str, Any],
             ]
         ] | None = None,
+        level: LogLevelName | None = None,
     ):
         filename: str | None = None
         directory: str | None = None
@@ -192,6 +199,7 @@ class Logger:
                 directory=directory,
                 retention_policy=retention_policy,
                 models=models,
+                level=level,
             )
 
             await self._contexts[name].stream.initialize()
@@ -220,6 +228,7 @@ class Logger:
                 dict[str, Any],
             ]
         ] | None = None,
+        level: LogLevelName | None = None,
     ):
         if name is None:
             name = 'default'
@@ -231,6 +240,7 @@ class Logger:
             name=name,
             nested=True,
             models=models,
+            level=level,
         ) as ctx:
             await ctx.log(
                 Log(
@@ -258,6 +268,7 @@ class Logger:
                 dict[str, Any],
             ]
         ] | None = None,
+        level: LogLevelName | None = None,
     ):
         if name is None:
             name = 'default'
@@ -269,6 +280,7 @@ class Logger:
             name=name,
             nested=True,
             models=models,
+            level=level,
         ) as ctx:
             await asyncio.gather(*[
                 ctx.put(
@@ -294,6 +306,7 @@ class Logger:
                 dict[str, Any],
             ]
         ] | None = None,
+        level: LogLevelName | None = None,
     ):
         if name is None:
             name = 'default'
@@ -305,6 +318,7 @@ class Logger:
             name=name,
             nested=True,
             models=models,
+            level=level,
         ) as ctx:
             await ctx.put(
                 Log(

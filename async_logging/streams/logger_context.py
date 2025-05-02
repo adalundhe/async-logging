@@ -2,6 +2,8 @@ import asyncio
 import os
 
 from typing import TypeVar, Any
+
+from async_logging.models import LogLevelName
 from .logger_stream import LoggerStream
 from .retention_policy import (
     RetentionPolicy,
@@ -25,12 +27,15 @@ class LoggerContext:
             type[T],
             dict[str, Any],
         ] | None = None,
+        level: LogLevelName | None = None,
     ) -> None:
         self.name = name
         self.template = template
         self.filename = filename
         self.directory = directory
         self.retention_policy = retention_policy
+        self.level = level
+
         self.stream = LoggerStream(
             name=name,
             template=template,
@@ -38,6 +43,7 @@ class LoggerContext:
             directory=directory,
             retention_policy=retention_policy,
             models=models,
+            level=level,
         )
         self.nested = nested
 
