@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import io
+import functools
 import os
 import pathlib
 import sys
@@ -12,6 +13,7 @@ from typing import (
     Dict,
     List,
     TypeVar,
+    Any,
 )
 
 import msgspec
@@ -31,9 +33,16 @@ from .retention_policy import (
     RetentionPolicy,
     RetentionPolicyConfig,
 )
-from .stream_type import StreamType
+from async_logging.config.stream_type import StreamType
 
 T = TypeVar('T', bound=Entry)
+
+try:
+    import uvloop as uvloop
+    has_uvloop = True
+
+except Exception:
+    has_uvloop = False
 
 
 def patch_transport_close(
@@ -60,6 +69,13 @@ class LoggerStream:
         filename: str | None = None,
         directory: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,
     ) -> None:
         if name is None:
             name = "default"
@@ -74,8 +90,6 @@ class LoggerStream:
             self._default_retention_policy = RetentionPolicy(retention_policy)
             self._default_retention_policy.parse()
 
-        self._stdout: io.TextIO | None = None
-        self._stderr: io.TextIO | None = None
         self._init_lock = asyncio.Lock()
         self._stream_writers: Dict[StreamType, asyncio.StreamWriter] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -98,6 +112,29 @@ class LoggerStream:
         self._stderr: io.TextIOBase | None = None
         self._stdout: io.TextIOBase | None = None
         self._transports: List[asyncio.Transport] = []
+        
+        self._models: Dict[str, Callable[..., Entry]] = {}
+        self._queue: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+
+        if models is None:
+            models = {}
+
+        for name, config in models.items():
+            model, defaults = config
+
+            self._models[name] = (
+                model,
+                defaults
+            )
+
+        self._models.update({
+            'default': (
+                Entry,
+                {
+                    'level': LogLevel.INFO
+                }
+            )
+        })
 
     @property
     def has_active_subscriptions(self):
@@ -127,18 +164,23 @@ class LoggerStream:
             if self._provider is None:
                 self._provider = LogProvider()
 
-            if self._stdout is None:
-                self._stdout = sys.stdout
+            if self._stdout is None or self._stdout.closed:
+                self._stdout = await self._dup_stdout()
 
-            if self._stderr is None:
-                self._stderr = sys.stderr
+            if self._stderr is None or self._stderr.closed:
+                self._stderr = await self._dup_stderr()
 
             if self._stream_writers.get(StreamType.STDOUT) is None:
                 transport, protocol = await self._loop.connect_write_pipe(
                     lambda: LoggerProtocol(), self._stdout
                 )
 
-                transport.close = patch_transport_close(transport, self._loop)
+                try:
+                    if has_uvloop:
+                        transport.close = patch_transport_close(transport, self._loop)
+                
+                except Exception:
+                    pass
 
                 self._stream_writers[StreamType.STDOUT] = asyncio.StreamWriter(
                     transport,
@@ -152,8 +194,13 @@ class LoggerStream:
                     lambda: LoggerProtocol(), self._stderr
                 )
 
+                try:
 
-                transport.close = patch_transport_close(transport, self._loop)
+                    if has_uvloop:
+                        transport.close = patch_transport_close(transport, self._loop)
+
+                except Exception:
+                    pass
 
                 self._stream_writers[StreamType.STDERR] = asyncio.StreamWriter(
                     transport,
@@ -172,17 +219,24 @@ class LoggerStream:
         retention_policy: RetentionPolicyConfig | None = None,
     ):
         if self._cwd is None:
-            self._cwd = await asyncio.to_thread(os.getcwd)
+            self._cwd = await self._loop.run_in_executor(
+                None,
+                os.getcwd,
+            )
 
         logfile_path = self._to_logfile_path(filename, directory=directory)
         await self._file_locks[logfile_path].acquire()
 
-        await asyncio.to_thread(
+        await self._loop.run_in_executor(
+            None,
             self._open_file,
             logfile_path,
         )
 
-        self._file_locks[logfile_path].release()
+        file_lock = self._file_locks[logfile_path]
+
+        if file_lock.locked():
+            file_lock.release()
 
         if retention_policy and self._retention_policies.get(logfile_path) is None:
 
@@ -216,13 +270,17 @@ class LoggerStream:
         retention_policy: RetentionPolicy
     ):
         await self._file_locks[logfile_path].acquire()
-        await asyncio.to_thread(
+        await self._loop.run_in_executor(
+            None,
             self._rotate_logfile,
             retention_policy,
             logfile_path,
         )
 
-        self._file_locks[logfile_path].release()
+        file_lock = self._file_locks[logfile_path]
+
+        if file_lock.locked():
+            file_lock.release()
 
     def _get_logfile_metadata(self, logfile_path: str) -> Dict[str, float]:
         resolved_path = pathlib.Path(logfile_path)
@@ -307,7 +365,6 @@ class LoggerStream:
         self, 
         shutdown_subscribed: bool = False
     ):
-
         self._consumer.stop()
         
         if shutdown_subscribed:
@@ -319,7 +376,10 @@ class LoggerStream:
         ] and self._consumer.pending:
             await self._consumer.wait_for_pending()
 
-            
+        while not self._queue.empty():
+            task = self._queue.get_nowait()
+            await task
+
         await asyncio.gather(
             *[self._close_file(logfile_path) for logfile_path in self._files]
         )
@@ -335,12 +395,17 @@ class LoggerStream:
             if (
                 logfile := self._files.get(logfile_path)
             ) and logfile.closed is False:
-                logfile.close()
+                try:
+                    logfile.close()
 
-        self._stderr.flush()
-        self._stdout.flush()
+                except Exception:
+                    pass
 
         self._consumer.abort()
+
+        while not self._queue.empty():
+            task = self._queue.get_nowait()
+            task.set_result(None)
 
     async def close_file(
         self,
@@ -348,20 +413,29 @@ class LoggerStream:
         directory: str | None = None,
     ):
         if self._cwd is None:
-            self._cwd = await asyncio.to_thread(os.getcwd)
+            self._cwd = await self._loop.run_in_executor(
+                None,
+                os.getcwd
+            )
 
         logfile_path = self._to_logfile_path(filename, directory=directory)
         await self._close_file(logfile_path)
 
     async def _close_file(self, logfile_path: str):
         if file_lock := self._file_locks.get(logfile_path):
+
+            if file_lock.locked():
+                file_lock.release()
+
             await file_lock.acquire()
-            await asyncio.to_thread(
+            await self._loop.run_in_executor(
+                None,
                 self._close_file_at_path,
                 logfile_path,
             )
 
-            file_lock.release()
+            if file_lock.locked():
+                file_lock.release()
 
     def _close_file_at_path(self, logfile_path: str):
         if (
@@ -380,12 +454,143 @@ class LoggerStream:
             filename_path.suffix == ".json"
         ), "Err. - file must be JSON file for logs."
 
-        if directory is None:
-            directory: str = os.path.join(self._cwd, "logs")
+        if self._config.directory:
+            directory = self._config.directory
+
+        elif directory is None:
+            directory: str = os.path.join(self._cwd)
 
         logfile_path: str = os.path.join(directory, filename_path)
 
         return logfile_path
+    
+    async def _dup_stdout(self):
+
+        stdout_fileno = await self._loop.run_in_executor(
+            None,
+            sys.stderr.fileno
+        )
+
+        stdout_dup = await self._loop.run_in_executor(
+            None,
+            os.dup,
+            stdout_fileno,
+        )
+
+        return await self._loop.run_in_executor(
+            None,
+            functools.partial(
+                os.fdopen,
+                stdout_dup,
+                mode=sys.stdout.mode
+            )
+        )
+
+    async def _dup_stderr(self):
+
+        stderr_fileno = await self._loop.run_in_executor(
+            None,
+            sys.stderr.fileno
+        )
+
+        stderr_dup = await self._loop.run_in_executor(
+            None,
+            os.dup,
+            stderr_fileno,
+        )
+
+        return await self._loop.run_in_executor(
+            None,
+            functools.partial(
+                os.fdopen,
+                stderr_dup,
+                mode=sys.stderr.mode
+            )
+        )
+    
+    def schedule(
+        self,
+        entry: T,
+        template: str | None = None,
+        path: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
+        filter: Callable[[T], bool] | None=None,
+    ):
+        self._queue.put_nowait(
+            asyncio.ensure_future(
+                self.log(
+                    entry,
+                    template=template,
+                    path=path,
+                    retention_policy=retention_policy,
+                    filter=filter,
+                )
+            )
+        )
+    
+    async def log_prepared_batch(
+        self,
+        model_messages: dict[str, list[str]],
+        template: str | None = None,
+        path: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
+        filter: Callable[[T], bool] | None=None,
+    ):
+        entries = [
+            self._to_entry(
+                message,
+                name,
+            ) for name, messages in model_messages.items() for message in messages
+        ]
+
+        if len (entries) > 0:
+            await asyncio.gather(*[
+                self.log(
+                    entry,
+                    template=template,
+                    path=path,
+                    retention_policy=retention_policy,
+                    filter=filter,
+                ) for entry in entries
+            ], return_exceptions=True)
+    
+    async def batch(
+        self,
+        entries: list[T],
+        template: str | None = None,
+        path: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
+        filter: Callable[[T], bool] | None=None,
+    ):
+        if len (entries) > 0:
+            await asyncio.gather(*[
+                self.log(
+                    entry,
+                    template=template,
+                    path=path,
+                    retention_policy=retention_policy,
+                    filter=filter,
+                ) for entry in entries
+            ], return_exceptions=True)
+
+    async def log_prepared(
+        self,
+        message: str,
+        name: str='default',
+        template: str | None = None,
+        path: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
+        filter: Callable[[T], bool] | None=None,
+    ):
+        entry = self._to_entry(message, name)
+
+        await self.log(
+            entry,
+            template=template,
+            path=path,
+            retention_policy=retention_policy,
+            filter=filter,
+        )
 
     async def log(
         self,
@@ -434,6 +639,21 @@ class LoggerStream:
                 filter=filter,
             )
 
+    def _to_entry(
+        self,
+        message: str,
+        name: str,
+    ):
+        model, defaults = self._models.get(
+            name,
+            self._models.get('default')
+        )
+
+        return model(
+            message=message,
+            **defaults
+        )
+
     async def _log(
         self,
         entry_or_log: T | Log[T],
@@ -448,17 +668,6 @@ class LoggerStream:
         else:
             entry = entry_or_log
 
-        stream = (
-            StreamType.STDOUT
-            if entry.level
-            in [
-                LogLevel.DEBUG,
-                LogLevel.INFO,
-                LogLevel.ERROR,
-            ]
-            else StreamType.STDERR
-        )
-
         if self._config.enabled(self._name, entry.level) is False:
             return
     
@@ -468,7 +677,7 @@ class LoggerStream:
         if self._initialized is None:
             await self.initialize()
 
-        stream_writer = self._stream_writers[stream]
+        stream_writer = self._stream_writers[self._config.output]
 
         if stream_writer.is_closing():
             return
@@ -484,6 +693,12 @@ class LoggerStream:
         else:
             log_file, line_number, function_name = self._find_caller()
 
+        if self._stdout is None or self._stdout.closed:
+            self._stdout = await self._dup_stdout()
+
+        if self._stderr is None or self._stderr.closed:
+            self._stderr = await self._dup_stderr()
+            
         try:
             stream_writer.write(
                 entry.to_template(
@@ -505,7 +720,8 @@ class LoggerStream:
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
             
             if self._stderr.closed is False:
-                await asyncio.to_thread(
+                await self._loop.run_in_executor(
+                    None,
                     self._stderr.write,
                     entry.to_template(
                         error_template,
@@ -543,7 +759,10 @@ class LoggerStream:
             return
         
         if self._cwd is None:
-            self._cwd = await asyncio.to_thread(os.getcwd)
+            self._cwd = await self._loop.run_in_executor(
+                None,
+                os.getcwd,
+            )
 
         if filename and directory:
             logfile_path = self._to_logfile_path(
@@ -559,7 +778,7 @@ class LoggerStream:
             directory = os.path.join(self._cwd, "logs")
             logfile_path = os.path.join(directory, filename)
 
-        if self._files.get(logfile_path) is None:
+        if self._files.get(logfile_path) is None or self._files[logfile_path].closed:
             await self.open_file(
                 filename,
                 directory=directory,
@@ -592,23 +811,33 @@ class LoggerStream:
             )
 
         try:
-            await self._file_locks[logfile_path].acquire()
 
-            await asyncio.to_thread(
+            file_lock = self._file_locks[logfile_path]
+            await file_lock.acquire()
+
+            await self._loop.run_in_executor(
+                None,
                 self._write_to_file,
                 log,
                 logfile_path,
             )
 
+            if file_lock.locked():
+                file_lock.release()
+
             await asyncio.sleep(0)
 
-            self._file_locks[logfile_path].release()
-
         except Exception as err:
+            file_lock = self._file_locks[logfile_path]
+            
+            if file_lock.locked():
+                file_lock.release()
+
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
 
             if self._stderr.closed is False:
-                await asyncio.to_thread(
+                await self._loop.run_in_executor(
+                    None,
                     self._stderr.write,
                     entry.to_template(
                         error_template,
@@ -625,16 +854,21 @@ class LoggerStream:
 
     def _write_to_file(
         self,
-        entry: Entry,
+        log: Log,
         logfile_path: str,
     ):
-        if (
-            logfile := self._files.get(logfile_path)
-        ) and (
-            logfile.closed is False
-        ):
-            
-            logfile.write(msgspec.json.encode(entry) + b"\n")
+        try:
+            if (
+                logfile := self._files.get(logfile_path)
+            ) and (
+                logfile.closed is False
+            ):
+                
+                logfile.write(msgspec.json.encode(log) + b"\n")
+                logfile.flush()
+
+        except Exception:
+            pass
 
     def _find_caller(self):
         """

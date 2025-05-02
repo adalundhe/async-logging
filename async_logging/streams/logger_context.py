@@ -1,7 +1,7 @@
 import asyncio
 import os
 
-from typing import TypeVar
+from typing import TypeVar, Any
 from .logger_stream import LoggerStream
 from .retention_policy import (
     RetentionPolicy,
@@ -20,6 +20,11 @@ class LoggerContext:
         filename: str | None = None,
         directory: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
+        nested: bool = False,
+        models: dict[
+            type[T],
+            dict[str, Any],
+        ] | None = None,
     ) -> None:
         self.name = name
         self.template = template
@@ -32,13 +37,19 @@ class LoggerContext:
             filename=filename,
             directory=directory,
             retention_policy=retention_policy,
+            models=models,
         )
+        self.nested = nested
 
     async def __aenter__(self):
         await self.stream.initialize()
 
         if self.stream._cwd is None:
-            self.stream._cwd = await asyncio.to_thread(os.getcwd)
+            loop = asyncio.get_event_loop()
+            self.stream._cwd = await loop.run_in_executor(
+                None,
+                os.getcwd,
+            )
 
         if self.filename:
             await self.stream.open_file(
@@ -62,4 +73,5 @@ class LoggerContext:
         return self.stream
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        pass
+        if self.nested is False:
+            await self.stream.close(shutdown_subscribed=self.stream.has_active_subscriptions)
