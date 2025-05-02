@@ -28,7 +28,7 @@ class LoggingConfig:
             _global_disabled_loggers
         )
         self._level_map = _global_level_map.get()
-        self._level = level
+        self._level = LogLevel.to_level(level)
 
     def update(
         self, 
