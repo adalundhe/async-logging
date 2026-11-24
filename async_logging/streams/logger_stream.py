@@ -1,7 +1,6 @@
 import asyncio
 import datetime
 import io
-import functools
 import os
 import pathlib
 import sys
@@ -11,7 +10,6 @@ from collections import defaultdict
 from typing import (
     Callable,
     Dict,
-    List,
     TypeVar,
     Any,
 )
@@ -28,37 +26,19 @@ from async_logging.queue import (
 )
 from async_logging.snowflake import SnowflakeGenerator
 
-from .protocol import LoggerProtocol
 from .retention_policy import (
     RetentionPolicy,
     RetentionPolicyConfig,
 )
+from .stdio_writer import (
+    StdioStreamWriter,
+    _STDERR_WRITE_LOCK,
+    _STDOUT_WRITE_LOCK,
+    write_bytes_to_stream_safe,
+)
 from async_logging.config.stream_type import StreamType
 
 T = TypeVar('T', bound=Entry)
-
-try:
-    import uvloop as uvloop
-    has_uvloop = True
-
-except Exception:
-    has_uvloop = False
-
-
-def patch_transport_close(
-    transport: asyncio.Transport, 
-    loop: asyncio.AbstractEventLoop,
-):
-
-    def close(*args, **kwargs):
-        try:
-
-            transport.close()
-
-        except Exception:
-            pass
-
-    return close
 
 
 class LoggerStream:
@@ -92,7 +72,7 @@ class LoggerStream:
             self._default_retention_policy.parse()
 
         self._init_lock = asyncio.Lock()
-        self._stream_writers: Dict[StreamType, asyncio.StreamWriter] = {}
+        self._stream_writers: Dict[StreamType, StdioStreamWriter] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._generator: SnowflakeGenerator | None = None
         self._compressor: zstandard.ZstdCompressor | None = None
@@ -110,11 +90,9 @@ class LoggerStream:
         self._initialized: bool = False
         self._consumer: LogConsumer | None = None
         self._provider: LogProvider | None = None
-        self._initialized: bool = False
         self._closed = False
         self._stderr: io.TextIOBase | None = None
         self._stdout: io.TextIOBase | None = None
-        self._transports: List[asyncio.Transport] = []
         
         self._models: Dict[str, Callable[..., Entry]] = {}
         self._queue: asyncio.Queue[asyncio.Future] = asyncio.Queue()
@@ -122,10 +100,10 @@ class LoggerStream:
         if models is None:
             models = {}
 
-        for name, config in models.items():
+        for model_name, config in models.items():
             model, defaults = config
 
-            self._models[name] = (
+            self._models[model_name] = (
                 model,
                 defaults
             )
@@ -141,13 +119,14 @@ class LoggerStream:
 
     @property
     def has_active_subscriptions(self):
-        return self._provider.subscriptions_count > 0
+        return self._provider is not None and self._provider.subscriptions_count > 0
 
-    async def initialize(self) -> asyncio.StreamWriter:
+    async def initialize(self) -> None:
 
         async with self._init_lock:
-            
-            if self._initialized:
+            current_loop = asyncio.get_running_loop()
+
+            if self._initialized and self._loop is current_loop:
                 return
 
             if self._generator is None:
@@ -158,8 +137,8 @@ class LoggerStream:
             if self._compressor is None:
                 self._compressor = zstandard.ZstdCompressor()
 
-            if self._loop is None:
-                self._loop = asyncio.get_event_loop()
+            loop_changed = self._loop is not None and self._loop is not current_loop
+            self._loop = current_loop
 
             if self._consumer is None:
                 self._consumer = LogConsumer()
@@ -167,49 +146,26 @@ class LoggerStream:
             if self._provider is None:
                 self._provider = LogProvider()
 
-            if self._stdout is None or self._stdout.closed:
-                self._stdout = await self._dup_stdout()
+            self._stdout = sys.stdout
+            self._stderr = sys.stderr
 
-            if self._stderr is None or self._stderr.closed:
-                self._stderr = await self._dup_stderr()
+            if loop_changed:
+                self._stream_writers.clear()
 
-            if self._stream_writers.get(StreamType.STDOUT) is None:
-                transport, protocol = await self._loop.connect_write_pipe(
-                    lambda: LoggerProtocol(), self._stdout
+            stdout_writer = self._stream_writers.get(StreamType.STDOUT)
+            if stdout_writer is None or stdout_writer.is_closing():
+                self._stream_writers[StreamType.STDOUT] = StdioStreamWriter(
+                    lambda: sys.stdout,
+                    loop=self._loop,
+                    write_lock=_STDOUT_WRITE_LOCK,
                 )
 
-                try:
-                    if has_uvloop:
-                        transport.close = patch_transport_close(transport, self._loop)
-                
-                except Exception:
-                    pass
-
-                self._stream_writers[StreamType.STDOUT] = asyncio.StreamWriter(
-                    transport,
-                    protocol,
-                    None,
-                    self._loop,
-                )
-
-            if self._stream_writers.get(StreamType.STDERR) is None:
-                transport, protocol = await self._loop.connect_write_pipe(
-                    lambda: LoggerProtocol(), self._stderr
-                )
-
-                try:
-
-                    if has_uvloop:
-                        transport.close = patch_transport_close(transport, self._loop)
-
-                except Exception:
-                    pass
-
-                self._stream_writers[StreamType.STDERR] = asyncio.StreamWriter(
-                    transport,
-                    protocol,
-                    None,
-                    self._loop,
+            stderr_writer = self._stream_writers.get(StreamType.STDERR)
+            if stderr_writer is None or stderr_writer.is_closing():
+                self._stream_writers[StreamType.STDERR] = StdioStreamWriter(
+                    lambda: sys.stderr,
+                    loop=self._loop,
+                    write_lock=_STDERR_WRITE_LOCK,
                 )
         
             self._initialized = True
@@ -259,8 +215,7 @@ class LoggerStream:
         logfile_directory = str(resolved_path.parent)
         path = str(resolved_path)
 
-        if not os.path.exists(logfile_directory):
-            os.makedirs(logfile_directory)
+        os.makedirs(logfile_directory, exist_ok=True)
 
         if not os.path.exists(path):
             resolved_path.touch()
@@ -293,8 +248,8 @@ class LoggerStream:
         )
 
         if os.path.exists(logfile_metadata_path):
-            metadata_file = open(logfile_metadata_path, "+rb")
-            return msgspec.json.decode(metadata_file.read())
+            with open(logfile_metadata_path, "rb") as metadata_file:
+                return msgspec.json.decode(metadata_file.read())
 
         return {}
 
@@ -309,7 +264,7 @@ class LoggerStream:
             str(resolved_path.parent.absolute().resolve()), ".logging.json"
         )
 
-        with open(logfile_metadata_path, "+wb") as metadata_file:
+        with open(logfile_metadata_path, "wb") as metadata_file:
             metadata_file.write(msgspec.json.encode(logfile_metadata))
 
     def _rotate_logfile(
@@ -368,28 +323,41 @@ class LoggerStream:
         self, 
         shutdown_subscribed: bool = False
     ):
-        self._consumer.stop()
+        if self._consumer is not None:
+            self._consumer.stop()
         
-        if shutdown_subscribed:
+        if shutdown_subscribed and self._provider is not None:
             await self._provider.signal_shutdown()
 
-        if self._consumer.status in  [
-            ConsumerStatus.RUNNING,
-            ConsumerStatus.CLOSING,
-        ] and self._consumer.pending:
+        if (
+            self._consumer is not None
+            and self._consumer.status in [
+                ConsumerStatus.RUNNING,
+                ConsumerStatus.CLOSING,
+            ]
+            and self._consumer.pending
+        ):
             await self._consumer.wait_for_pending()
 
         while not self._queue.empty():
             task = self._queue.get_nowait()
             await task
 
-        await asyncio.gather(
-            *[self._close_file(logfile_path) for logfile_path in self._files]
-        )
+        if self._files:
+            await asyncio.gather(
+                *[self._close_file(logfile_path) for logfile_path in self._files]
+            )
         
-        await asyncio.gather(
-            *[writer.drain() for writer in self._stream_writers.values()]
-        )
+        if self._stream_writers:
+            writers = list(self._stream_writers.values())
+            for writer in writers:
+                writer.close()
+
+            await asyncio.gather(
+                *[writer.wait_closed() for writer in writers],
+                return_exceptions=True,
+            )
+            self._stream_writers.clear()
 
         self._initialized = False
 
@@ -404,11 +372,19 @@ class LoggerStream:
                 except Exception:
                     pass
 
-        self._consumer.abort()
+        if self._consumer is not None:
+            self._consumer.abort()
+
+        for writer in self._stream_writers.values():
+            writer.abort()
+        self._stream_writers.clear()
 
         while not self._queue.empty():
             task = self._queue.get_nowait()
-            task.set_result(None)
+            if not task.done():
+                task.cancel()
+
+        self._initialized = False
 
     async def close_file(
         self,
@@ -467,48 +443,15 @@ class LoggerStream:
 
         return logfile_path
     
-    async def _dup_stdout(self):
-
-        stdout_fileno = await self._loop.run_in_executor(
+    async def _write_error(self, message: str) -> None:
+        payload = (message + "\n").encode("utf-8", errors="replace")
+        loop = self._loop if self._loop is not None and not self._loop.is_closed() else asyncio.get_running_loop()
+        await loop.run_in_executor(
             None,
-            sys.stderr.fileno
-        )
-
-        stdout_dup = await self._loop.run_in_executor(
-            None,
-            os.dup,
-            stdout_fileno,
-        )
-
-        return await self._loop.run_in_executor(
-            None,
-            functools.partial(
-                os.fdopen,
-                stdout_dup,
-                mode=sys.stdout.mode
-            )
-        )
-
-    async def _dup_stderr(self):
-
-        stderr_fileno = await self._loop.run_in_executor(
-            None,
-            sys.stderr.fileno
-        )
-
-        stderr_dup = await self._loop.run_in_executor(
-            None,
-            os.dup,
-            stderr_fileno,
-        )
-
-        return await self._loop.run_in_executor(
-            None,
-            functools.partial(
-                os.fdopen,
-                stderr_dup,
-                mode=sys.stderr.mode
-            )
+            write_bytes_to_stream_safe,
+            sys.stderr,
+            payload,
+            _STDERR_WRITE_LOCK,
         )
     
     def schedule(
@@ -677,12 +620,12 @@ class LoggerStream:
         if filter and filter(entry) is False:
             return
 
-        if self._initialized is None:
+        if not self._initialized or self._loop is None or self._loop.is_closed():
             await self.initialize()
 
-        stream_writer = self._stream_writers[self._config.output]
+        stream_writer = self._stream_writers.get(self._config.output)
 
-        if stream_writer.is_closing():
+        if stream_writer is None or stream_writer.is_closing():
             return
 
         if template is None:
@@ -696,12 +639,6 @@ class LoggerStream:
         else:
             log_file, line_number, function_name = self._find_caller()
 
-        if self._stdout is None or self._stdout.closed:
-            self._stdout = await self._dup_stdout()
-
-        if self._stderr is None or self._stderr.closed:
-            self._stderr = await self._dup_stderr()
-            
         try:
             stream_writer.write(
                 entry.to_template(
@@ -713,31 +650,30 @@ class LoggerStream:
                         "thread_id": threading.get_native_id(),
                         "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
                     },
-                ).encode()
+                ).encode("utf-8")
                 + b"\n"
             )
             
             await stream_writer.drain()
 
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
         except Exception as err:
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
-            
-            if self._stderr.closed is False:
-                await self._loop.run_in_executor(
-                    None,
-                    self._stderr.write,
-                    entry.to_template(
-                        error_template,
-                        context={
-                            "filename": log_file,
-                            "function_name": function_name,
-                            "line_number": line_number,
-                            "error": str(err),
-                            "thread_id": threading.get_native_id(),
-                            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
-                        },
-                    ),
+            await self._write_error(
+                entry.to_template(
+                    error_template,
+                    context={
+                        "filename": log_file,
+                        "function_name": function_name,
+                        "line_number": line_number,
+                        "error": str(err),
+                        "thread_id": threading.get_native_id(),
+                        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                    },
                 )
+            )
 
     async def _log_to_file(
         self,
@@ -760,6 +696,9 @@ class LoggerStream:
 
         if filter and  filter(entry) is False:
             return
+
+        if not self._initialized or self._loop is None or self._loop.is_closed():
+            await self.initialize()
         
         if self._cwd is None:
             self._cwd = await self._loop.run_in_executor(
@@ -838,22 +777,19 @@ class LoggerStream:
 
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
 
-            if self._stderr.closed is False:
-                await self._loop.run_in_executor(
-                    None,
-                    self._stderr.write,
-                    entry.to_template(
-                        error_template,
-                        context={
-                            "filename": log_file,
-                            "function_name": function_name,
-                            "line_number": line_number,
-                            "error": str(err),
-                            "thread_id": threading.get_native_id(),
-                            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
-                        },
-                    ),
+            await self._write_error(
+                entry.to_template(
+                    error_template,
+                    context={
+                        "filename": log_file,
+                        "function_name": function_name,
+                        "line_number": line_number,
+                        "error": str(err),
+                        "thread_id": threading.get_native_id(),
+                        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                    },
                 )
+            )
 
     def _write_to_file(
         self,
